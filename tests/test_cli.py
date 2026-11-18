@@ -472,3 +472,16 @@ def test_unset_home_with_no_config_in_cwd_fails_loudly(tmp_path, client, monkeyp
 def test_connections_wait_for_the_write_lock_instead_of_failing_at_5s(tmp_path):
     conn = connect(tmp_path / "x.db")
     assert conn.execute("PRAGMA busy_timeout").fetchone()[0] >= 30_000
+
+
+def test_scheduled_job_releases_the_lock_when_opening_the_database_fails(home, client, monkeypatch):
+    import sqlite3
+    from crm.sync import SYNC_LOCK
+
+    def locked(cfg):
+        raise sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(cli, "_open", locked)
+    with pytest.raises(sqlite3.OperationalError):
+        cli.scheduled_sync(cfg_for(home))
+    assert SYNC_LOCK.acquire(blocking=False)
+    SYNC_LOCK.release()

@@ -204,8 +204,9 @@ def scheduled_sync(cfg: Config) -> None:
     if not SYNC_LOCK.acquire(blocking=False):
         log.info("skipping scheduled sync: another sync is running")
         return
-    conn = _open(cfg)
+    conn = None
     try:
+        conn = _open(cfg)     # inside the try: a locked database must not leak the lock
         missing = never_backfilled(conn)
         if missing:
             log.warning("skipping sync: never backfilled (%s); run `watchdog "
@@ -218,7 +219,8 @@ def scheduled_sync(cfg: Config) -> None:
             log.warning("sync: %s", error)
         log.info("sync finished: %s", report.per_type)
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
         SYNC_LOCK.release()
 
 

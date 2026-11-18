@@ -18,10 +18,12 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Callable
 
 import httpx
 
+from crm.config import load_thresholds
 from crm.db import upsert, upsert_sql
 from crm.hubspot import (
     ENGAGEMENT_TYPES,
@@ -30,6 +32,7 @@ from crm.hubspot import (
     PROPERTIES,
     RateLimited,
 )
+from crm.signals import evaluate_all
 
 __all__ = [
     "reconcile", "sync_archived",
@@ -150,6 +153,13 @@ def normalise_record(object_type: str, record: dict) -> dict:
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+THRESHOLDS_PATH = Path(__file__).resolve().parent.parent / "signals.toml"
+
+
+def _evaluate_signals(conn: sqlite3.Connection) -> None:
+    evaluate_all(conn, load_thresholds(THRESHOLDS_PATH), _now_ms())
 
 
 def _state_sql(object_type: str, fields: dict) -> tuple[str, list]:
@@ -441,6 +451,7 @@ def sync_incremental(conn: sqlite3.Connection, client,
             continue
         report.per_type[object_type] = _sync_object_type(
             conn, client, object_type, report)
+    _evaluate_signals(conn)
     return report
 
 
@@ -691,6 +702,7 @@ def backfill(conn: sqlite3.Connection, client,
                 report.errors.append(f"{api_type}: {exc}")
                 break
         report.per_type[object_type] = count
+    _evaluate_signals(conn)
     return report
 
 

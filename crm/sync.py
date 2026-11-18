@@ -441,15 +441,15 @@ def sync_incremental(conn: sqlite3.Connection, client,
             continue
         report.per_type[object_type] = _sync_object_type(
             conn, client, object_type, report)
-        # Modified-date search never returns archived records, so deletions
-        # are only ever seen here. Skipped with the type above while a backfill
-        # owns it (the walk excludes archived records; this pass runs once the
-        # type is complete).
-        report.errors.extend(sync_archived(conn, client, [object_type]).errors)
     return report
 
 
 # --- archives and reconciliation ----------------------------------------------
+# Weekly operations, deliberately NOT part of sync_incremental: the archived
+# listing has no modified filter, so every pass re-reads all of it, and
+# reconcile pages every id. On a large account either would exhaust the daily
+# request cap if run every 15 minutes. A record archived in HubSpot therefore
+# lingers in the briefing for up to a week.
 
 def _pages(fetch: Callable[[str | None], object]):
     """Yield each page from `fetch(after)` until the cursor runs out."""
@@ -481,51 +481,79 @@ def sync_archived(conn: sqlite3.Connection, client,
                     rows = [{**normalise_record(api_type, r), "archived": 1}
                             for r in page.records]
                     count += upsert(conn, table_for(api_type), rows)
-        except _TYPE_ERRORS as exc:
+        except (RateLimited, *_TYPE_ERRORS) as exc:
+            # One type's failure must not starve the others.
             report.errors.append(f"{object_type} archived: {exc}")
         report.per_type[object_type] = count
     return report
 
 
-def reconcile(conn: sqlite3.Connection, client) -> dict[str, int]:
+# A walk returning fewer than this share of HubSpot's own record count is
+# treated as truncated. 1% absorbs deletes landing mid-walk.
+RECONCILE_MIN_COVERAGE = 0.99
+
+
+class ReconcileResult(dict):
+    """{object_type: rows newly archived}, plus `skipped`: {object_type: reason}.
+
+    A type is in exactly one of the two, so a guarded or ungated type is never
+    mistaken for a clean zero.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.skipped: dict[str, str] = {}
+
+
+def reconcile(conn: sqlite3.Connection, client) -> ReconcileResult:
     """Weekly: flag local rows whose id HubSpot no longer lists as archived.
 
     Catches *hard* deletes, which appear in neither the search nor the archived
     listing. Pages every id, so it is not a per-run operation.
 
     Safety, since a wrong archive silently drops a live deal from the briefing:
-    - only types whose backfill is `complete` are reconciled; others are
-      absent from the result;
+    - only types whose backfill is `complete` are reconciled;
+    - the local ids are snapshotted *before* the remote walk, so a record
+      created during the (long) walk and synced locally meanwhile is never a
+      candidate;
     - the whole remote id set is collected before anything is written, so a
-      failed or partial walk (any exception, including RateLimited, which
-      propagates) archives nothing for that type;
-    - an empty remote set against live local rows is treated as a failed read
-      and skipped rather than archiving everything;
+      failed walk (any exception, RateLimited included, which propagates)
+      archives nothing for that type;
+    - a walk that succeeds but is short (fewer ids than 99% of `client.count`,
+      or empty against live local rows) is treated as truncated and refused;
+    - an object type is written all-or-nothing across its api types;
     - rows are never deleted, only `archived = 1`.
-    Returns {object_type: rows newly archived}.
+    Types not reconciled are listed in `result.skipped` with a reason.
     """
-    result: dict[str, int] = {}
+    result = ReconcileResult()
     for object_type in INCREMENTAL_TYPES:
         if not all(_is_complete(conn, t) for t in api_types(object_type)):
+            result.skipped[object_type] = "backfill not complete"
             continue
-        table, archived_now = table_for(object_type), 0
+        table = table_for(object_type)
+        plan: list[tuple[str]] = []
+        reason = None
         for api_type in api_types(object_type):
-            remote: set[str] = set()
-            for page in _pages(lambda after: client.list_ids_page(api_type, after)):
-                remote.update(str(r["id"]) for r in page.records)
             where, params = "archived = 0", []
             if table == "engagements":
                 where, params = "archived = 0 AND type = ?", [api_type]
             local = [r["id"] for r in conn.execute(
                 f"SELECT id FROM {table} WHERE {where}", params)]
-            if not remote and local:
-                continue
-            stale = [(i,) for i in local if i not in remote]
-            with conn:
-                conn.executemany(
-                    f"UPDATE {table} SET archived = 1 WHERE id = ?", stale)
-            archived_now += len(stale)
-        result[object_type] = archived_now
+            remote: set[str] = set()
+            for page in _pages(lambda after: client.list_ids_page(api_type, after)):
+                remote.update(str(r["id"]) for r in page.records)
+            expected = client.count(api_type)
+            if (not remote and local) or len(remote) < expected * RECONCILE_MIN_COVERAGE:
+                reason = (f"{api_type}: id walk returned {len(remote)} ids, "
+                          f"HubSpot counts {expected}; treated as truncated")
+                break
+            plan.extend((i,) for i in local if i not in remote)
+        if reason:
+            result.skipped[object_type] = reason
+            continue
+        with conn:
+            conn.executemany(f"UPDATE {table} SET archived = 1 WHERE id = ?", plan)
+        result[object_type] = len(plan)
     return result
 
 

@@ -94,7 +94,8 @@ def test_reconcile_skips_types_without_a_complete_backfill(conn, fake_client):
     complete(conn, "companies")
     set_phase(conn, "backfill", "deals")
     result = reconcile(conn, fake_client)
-    assert "deals" not in result and flags(conn) == {"1": 0}
+    assert "deals" not in result and "deals" in result.skipped
+    assert flags(conn) == {"1": 0}
     assert all(c.object_type != "deals" for c in fake_client.ids_only_calls)
 
 
@@ -102,7 +103,7 @@ def test_reconcile_empty_remote_set_is_not_trusted(conn, fake_client):
     upsert(conn, "deals", [{"id": "1"}])
     complete(conn, "deals")
     fake_client.remote_ids["deals"] = []
-    assert reconcile(conn, fake_client)["deals"] == 0
+    assert "deals" not in reconcile(conn, fake_client)
     assert flags(conn) == {"1": 0}
 
 
@@ -117,13 +118,69 @@ def test_reconcile_scopes_engagement_ids_per_api_type(conn, fake_client):
     assert flags(conn, "engagements") == {"1": 0, "2": 0, "3": 1}
 
 
-def test_incremental_run_includes_archived_pass(conn, fake_client):
+def test_incremental_run_does_not_run_the_archived_pass(conn, fake_client):
     sync_incremental(conn, fake_client, ["deals"])
-    assert any(c.archived for c in fake_client.list_calls)
+    assert not any(c.archived for c in fake_client.list_calls)
 
 
-def test_incremental_skips_archived_pass_for_backfilling_type(conn, fake_client):
-    set_phase(conn, "backfill", "deals")
-    sync_incremental(conn, fake_client, ["deals"])
-    assert not any(c.archived and c.object_type == "deals"
-                   for c in fake_client.list_calls)
+def test_sync_archived_rate_limit_is_confined_to_its_type(conn, fake_client):
+    fake_client.archived["deals"] = [{"id": "1"}]
+    real = fake_client.list_page
+
+    def flaky(object_type, after, archived=False):
+        if object_type == "companies":
+            raise RateLimited("fake 429")
+        return real(object_type, after, archived)
+
+    fake_client.list_page = flaky
+    report = sync_archived(conn, fake_client, ["companies", "deals"])
+    assert any(e.startswith("companies archived") for e in report.errors)
+    assert flags(conn) == {"1": 1}
+
+
+def test_reconcile_ignores_rows_synced_during_the_walk(conn, fake_client):
+    upsert(conn, "deals", [{"id": "1"}, {"id": "2"}])
+    complete(conn, "deals")
+    fake_client.remote_ids["deals"] = ["1", "2"]
+    fake_client.ids_page_size = 1
+    real = fake_client.list_ids_page
+
+    def create_mid_walk(object_type, after):
+        if after is not None:   # second page: incremental syncs a new deal
+            upsert(conn, "deals", [{"id": "NEW"}])
+        return real(object_type, after)
+
+    fake_client.list_ids_page = create_mid_walk
+    assert reconcile(conn, fake_client)["deals"] == 0
+    assert flags(conn)["NEW"] == 0
+
+
+def test_reconcile_refuses_a_truncated_walk(conn, fake_client):
+    upsert(conn, "deals", [{"id": str(i)} for i in range(1, 6)])
+    complete(conn, "deals")
+    fake_client.remote_ids["deals"] = ["1", "2"]   # short, but non-empty
+    fake_client.counts["deals"] = 5
+    result = reconcile(conn, fake_client)
+    assert "deals" not in result and "truncated" in result.skipped["deals"]
+    assert set(flags(conn).values()) == {0}
+
+
+def test_reconcile_reports_skips_distinguishably(conn, fake_client):
+    upsert(conn, "deals", [{"id": "1"}])
+    complete(conn, "deals")
+    fake_client.remote_ids["deals"] = []
+    result = reconcile(conn, fake_client)
+    assert "deals" not in result
+    assert "deals" in result.skipped and "companies" in result.skipped
+    assert "backfill not complete" in result.skipped["companies"]
+
+
+def test_reconcile_engagements_all_or_nothing(conn, fake_client):
+    upsert(conn, "engagements", [
+        {"id": "1", "type": "calls"}, {"id": "2", "type": "notes"}])
+    complete(conn, "calls", "meetings", "emails", "notes", "tasks")
+    fake_client.remote_ids["calls"] = []          # calls guarded
+    fake_client.remote_ids["notes"] = ["9"]       # notes would archive "2"
+    result = reconcile(conn, fake_client)
+    assert "engagements" in result.skipped
+    assert flags(conn, "engagements") == {"1": 0, "2": 0}

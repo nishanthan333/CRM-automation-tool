@@ -380,7 +380,11 @@ def test_reference_data_failure_does_not_gate_the_object_sync(
         conn, fake_client):
     two_deal_pages(fake_client)
 
+    real = fake_client.list_page
+
     def boom(object_type, after, archived=False):
+        if object_type != "owners":
+            return real(object_type, after, archived)
         raise RateLimited("fake 429 on owners")
 
     fake_client.list_page = boom
@@ -437,7 +441,8 @@ def test_owners_are_refreshed_in_full_never_through_search(conn, fake_client):
          "lastName": "Rivera", "archived": False}])])
     two_deal_pages(fake_client)
     sync_incremental(conn, fake_client, ["deals"])
-    assert [c.object_type for c in fake_client.list_calls] == ["owners"]
+    assert [c.object_type for c in fake_client.list_calls
+            if not c.archived] == ["owners"]
     assert all(c.object_type != "owners" for c in fake_client.search_calls)
     assert conn.execute("select email from owners").fetchone()[0] == "sam@example.com"
 

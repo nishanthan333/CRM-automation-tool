@@ -57,6 +57,8 @@ class FakeClient:
         # (from_type, to_type) -> {from_id: [to_id, ...]}
         self.associations: dict[tuple[str, str], dict[str, list[str]]] = {}
         self.fail_on_page: int | None = None
+        # None serves the whole id set as one page; an int splits it.
+        self.ids_page_size: int | None = None
         self.search_calls: list[Call] = []
         self.list_calls: list[Call] = []
         self.ids_only_calls: list[Call] = []
@@ -86,6 +88,8 @@ class FakeClient:
         if isinstance(spec, int):
             spec = [[{"id": f"{object_type}-{p}-{i}", "properties": {}}
                      for i in range(2)] for p in range(spec)]
+        if spec and all(isinstance(r, dict) for r in spec):
+            spec = [spec]   # a bare record list is one page
         pages = [p if isinstance(p, FakePage) else FakePage(records=list(p))
                  for p in spec]
         if not pages:
@@ -130,8 +134,16 @@ class FakeClient:
     def list_ids_page(self, object_type: str, after: str | None) -> Page:
         self.ids_only_calls.append(Call(
             kind="ids", object_type=object_type, after=after))
-        records = [{"id": str(i)} for i in self.remote_ids.get(object_type, [])]
-        return Page(records=records, after=None)
+        key = f"ids:{object_type}"
+        self._requests[key] = self._requests.get(key, 0) + 1
+        if self.fail_on_page is not None and self._requests[key] == self.fail_on_page:
+            raise RateLimited(f"fake 429 on id page {self.fail_on_page} of {object_type}")
+        ids = [str(i) for i in self.remote_ids.get(object_type, [])]
+        size = self.ids_page_size or max(len(ids), 1)
+        start = 0 if after is None else int(after.rsplit("-", 1)[1])
+        end = start + size
+        return Page(records=[{"id": i} for i in ids[start:end]],
+                    after=f"ids-{end}" if end < len(ids) else None)
 
     def batch_associations(self, from_type: str, to_type: str,
                            ids: list[str]) -> dict[str, list[str]]:

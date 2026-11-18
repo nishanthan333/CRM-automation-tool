@@ -32,6 +32,7 @@ from crm.hubspot import (
 )
 
 __all__ = [
+    "reconcile", "sync_archived",
     "BACKFILL_ORDER", "Estimate", "backfill", "estimate_backfill",
     "ASSOCIATION_PAIRS", "INCREMENTAL_TYPES", "SEARCH_RESULT_CAP",
     "SEARCH_WINDOW_LIMIT", "SyncReport", "WATERMARK_REWIND_MS", "cursor",
@@ -440,7 +441,92 @@ def sync_incremental(conn: sqlite3.Connection, client,
             continue
         report.per_type[object_type] = _sync_object_type(
             conn, client, object_type, report)
+        # Modified-date search never returns archived records, so deletions
+        # are only ever seen here. Skipped with the type above while a backfill
+        # owns it (the walk excludes archived records; this pass runs once the
+        # type is complete).
+        report.errors.extend(sync_archived(conn, client, [object_type]).errors)
     return report
+
+
+# --- archives and reconciliation ----------------------------------------------
+
+def _pages(fetch: Callable[[str | None], object]):
+    """Yield each page from `fetch(after)` until the cursor runs out."""
+    after = None
+    while True:
+        page = fetch(after)
+        yield page
+        if page.after is None:
+            return
+        after = page.after
+
+
+def sync_archived(conn: sqlite3.Connection, client,
+                  object_types: list[str] | None = None) -> SyncReport:
+    """Page the archived listing of each type and upsert with `archived = 1`.
+
+    Stateless: it touches neither cursor nor watermark, so it is safe whatever
+    the type's phase (`sync_incremental` still only calls it for types it
+    syncs). The listing has no modified filter, so each pass re-reads it in
+    full; upserts make that idempotent.
+    """
+    report = SyncReport()
+    for object_type in object_types or INCREMENTAL_TYPES:
+        count = 0
+        try:
+            for api_type in api_types(object_type):
+                for page in _pages(lambda after: client.list_page(
+                        api_type, after, archived=True)):
+                    rows = [{**normalise_record(api_type, r), "archived": 1}
+                            for r in page.records]
+                    count += upsert(conn, table_for(api_type), rows)
+        except _TYPE_ERRORS as exc:
+            report.errors.append(f"{object_type} archived: {exc}")
+        report.per_type[object_type] = count
+    return report
+
+
+def reconcile(conn: sqlite3.Connection, client) -> dict[str, int]:
+    """Weekly: flag local rows whose id HubSpot no longer lists as archived.
+
+    Catches *hard* deletes, which appear in neither the search nor the archived
+    listing. Pages every id, so it is not a per-run operation.
+
+    Safety, since a wrong archive silently drops a live deal from the briefing:
+    - only types whose backfill is `complete` are reconciled; others are
+      absent from the result;
+    - the whole remote id set is collected before anything is written, so a
+      failed or partial walk (any exception, including RateLimited, which
+      propagates) archives nothing for that type;
+    - an empty remote set against live local rows is treated as a failed read
+      and skipped rather than archiving everything;
+    - rows are never deleted, only `archived = 1`.
+    Returns {object_type: rows newly archived}.
+    """
+    result: dict[str, int] = {}
+    for object_type in INCREMENTAL_TYPES:
+        if not all(_is_complete(conn, t) for t in api_types(object_type)):
+            continue
+        table, archived_now = table_for(object_type), 0
+        for api_type in api_types(object_type):
+            remote: set[str] = set()
+            for page in _pages(lambda after: client.list_ids_page(api_type, after)):
+                remote.update(str(r["id"]) for r in page.records)
+            where, params = "archived = 0", []
+            if table == "engagements":
+                where, params = "archived = 0 AND type = ?", [api_type]
+            local = [r["id"] for r in conn.execute(
+                f"SELECT id FROM {table} WHERE {where}", params)]
+            if not remote and local:
+                continue
+            stale = [(i,) for i in local if i not in remote]
+            with conn:
+                conn.executemany(
+                    f"UPDATE {table} SET archived = 1 WHERE id = ?", stale)
+            archived_now += len(stale)
+        result[object_type] = archived_now
+    return result
 
 
 # --- backfill ----------------------------------------------------------------

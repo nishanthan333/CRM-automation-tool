@@ -4,7 +4,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from crm.hubspot import MODIFIED_PROPERTY, HubSpotClient, Page, RateLimited
+from crm.hubspot import ENGAGEMENT_TYPES, MODIFIED_PROPERTY, HubSpotClient, Page, RateLimited
 
 FIXTURES = Path(__file__).parent / "fixtures" / "hubspot"
 
@@ -97,7 +97,7 @@ def test_modified_property_differs_for_contacts():
     assert MODIFIED_PROPERTY["contacts"] == "lastmodifieddate"
     assert MODIFIED_PROPERTY["deals"] == "hs_lastmodifieddate"
     assert MODIFIED_PROPERTY["companies"] == "hs_lastmodifieddate"
-    assert MODIFIED_PROPERTY["engagements"] == "hs_lastmodifieddate"
+    assert all(MODIFIED_PROPERTY[t] == "hs_lastmodifieddate" for t in ENGAGEMENT_TYPES)
 
 
 def test_search_filters_on_modified_property_in_epoch_ms():
@@ -236,3 +236,52 @@ def test_client_never_issues_write_methods():
         "/search" in str(r.url) or "/batch/read" in str(r.url)
         for r in requests if r.method == "POST"
     )
+
+
+def test_engagement_types_route_to_their_own_paths_never_generic_engagements():
+    client, requests = make_client(
+        lambda r: httpx.Response(200, json=fixture("calls_page.json"))
+    )
+    assert ENGAGEMENT_TYPES == ["calls", "meetings", "emails", "notes", "tasks"]
+    for t in ENGAGEMENT_TYPES:
+        page = client.list_page(t, after=None)
+        assert page.records[0]["properties"]["hs_timestamp"]
+        client.search_modified_since(t, 1, None)
+    paths = [r.url.path for r in requests]
+    assert paths == [p for t in ENGAGEMENT_TYPES
+                     for p in (f"/crm/v3/objects/{t}", f"/crm/v3/objects/{t}/search")]
+    assert not any("engagements" in p for p in paths)
+    assert requests[0].url.params["properties"] == "hs_timestamp,hs_lastmodifieddate"
+
+
+def test_transport_errors_are_retried_then_succeed():
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        if len(calls) <= 2:
+            raise httpx.ConnectError("boom", request=request)
+        return httpx.Response(200, json=fixture("deals_page2.json"))
+
+    sleeps: list[float] = []
+    client, _ = make_client(handler, sleeps)
+    assert client.list_page("deals", after=None).records[0]["id"] == "4003"
+    assert len(calls) == 3
+    assert len(sleeps) == 2 and sleeps[0] < sleeps[1]
+
+
+def test_persistent_transport_error_raises_rate_limited():
+    def handler(request):
+        raise httpx.ReadTimeout("slow", request=request)
+
+    sleeps: list[float] = []
+    client, _ = make_client(handler, sleeps, max_attempts=3)
+    with pytest.raises(RateLimited):
+        client.list_page("deals", after=None)
+    assert len(sleeps) == 2
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_max_attempts_must_be_at_least_one(bad):
+    with pytest.raises(ValueError):
+        HubSpotClient("t", max_attempts=bad)

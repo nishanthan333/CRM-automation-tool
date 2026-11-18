@@ -1,0 +1,6 @@
+{
+  "results": [
+    {"id": "12001", "properties": {"hs_createdate": "2026-11-03T15:01:00.000Z", "hs_lastmodifieddate": "2026-11-03T15:20:41.100Z", "hs_object_id": "12001", "hs_timestamp": "2026-11-03T15:00:00.000Z"}, "createdAt": "2026-11-03T15:01:00.000Z", "updatedAt": "2026-11-03T15:20:41.100Z", "archived": false}
+  ],
+  "paging": {"next": {"after": "12001", "link": "https://api.hubapi.com/crm/v3/objects/calls?after=12001"}}
+}

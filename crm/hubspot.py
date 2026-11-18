@@ -6,11 +6,15 @@ from typing import Callable
 
 import httpx
 
-__all__ = ["HubSpotClient", "MODIFIED_PROPERTY", "Page", "RateLimited"]
+__all__ = ["ENGAGEMENT_TYPES", "HubSpotClient", "MODIFIED_PROPERTY", "Page", "RateLimited"]
 
 BASE_URL = "https://api.hubapi.com"
 PAGE_SIZE = 100
 ASSOC_CHUNK = 100
+
+# HubSpot v3 has no generic "engagements" object; these five are separate types
+# that all feed the one local `engagements` table (type = endpoint name).
+ENGAGEMENT_TYPES = ["calls", "meetings", "emails", "notes", "tasks"]
 
 # Must match the columns in crm/db.py.
 PROPERTIES: dict[str, list[str]] = {
@@ -27,7 +31,7 @@ PROPERTIES: dict[str, list[str]] = {
         "firstname", "lastname", "email", "hubspot_owner_id",
         "hs_last_activity_date", "lastmodifieddate",
     ],
-    "engagements": ["type", "timestamp", "hs_lastmodifieddate"],
+    **{t: ["hs_timestamp", "hs_lastmodifieddate"] for t in ENGAGEMENT_TYPES},
     # Owners carry email/firstName/lastName as top-level fields, not properties.
     "owners": [],
 }
@@ -36,7 +40,7 @@ MODIFIED_PROPERTY: dict[str, str] = {
     "deals": "hs_lastmodifieddate",
     "companies": "hs_lastmodifieddate",
     "contacts": "lastmodifieddate",
-    "engagements": "hs_lastmodifieddate",
+    **{t: "hs_lastmodifieddate" for t in ENGAGEMENT_TYPES},
 }
 
 # Owners are not CRM objects; everything else lives under /crm/v3/objects.
@@ -63,6 +67,8 @@ class HubSpotClient:
         base_delay: float = 1.0,
         sleep: Callable[[float], None] = time.sleep,
     ):
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be >= 1")
         self._token = token
         self._http = http or httpx.Client(base_url=BASE_URL, timeout=30.0)
         self._max_attempts = max_attempts
@@ -72,16 +78,19 @@ class HubSpotClient:
     def _request(self, method: str, path: str, **kwargs) -> dict:
         headers = {"Authorization": f"Bearer {self._token}"}
         for attempt in range(self._max_attempts):
-            resp = self._http.request(method, BASE_URL + path, headers=headers, **kwargs)
-            if resp.status_code != 429 and resp.status_code < 500:
-                resp.raise_for_status()
-                return resp.json()
+            try:
+                resp = self._http.request(method, BASE_URL + path, headers=headers, **kwargs)
+            except httpx.TransportError as exc:
+                failure = f"{type(exc).__name__}"
+            else:
+                if resp.status_code != 429 and resp.status_code < 500:
+                    resp.raise_for_status()
+                    return resp.json()
+                failure = f"HTTP {resp.status_code}"
             if attempt < self._max_attempts - 1:
                 delay = self._base_delay * 2**attempt
                 self._sleep(delay + random.uniform(0, self._base_delay))
-        raise RateLimited(
-            f"{method} {path}: HTTP {resp.status_code} after {self._max_attempts} attempts"
-        )
+        raise RateLimited(f"{method} {path}: {failure} after {self._max_attempts} attempts")
 
     @staticmethod
     def _page(data: dict) -> Page:

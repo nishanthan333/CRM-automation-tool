@@ -21,11 +21,16 @@ from datetime import datetime, timezone
 import httpx
 
 from crm.db import upsert, upsert_sql
-from crm.hubspot import ENGAGEMENT_TYPES, MODIFIED_PROPERTY, PROPERTIES
+from crm.hubspot import (
+    ENGAGEMENT_TYPES,
+    MODIFIED_PROPERTY,
+    PROPERTIES,
+    RateLimited,
+)
 
 __all__ = [
-    "ASSOCIATION_PAIRS", "INCREMENTAL_TYPES", "SyncReport",
-    "WATERMARK_REWIND_MS", "cursor", "normalise_record", "refresh_associations",
+    "ASSOCIATION_PAIRS", "INCREMENTAL_TYPES", "SEARCH_RESULT_CAP",
+    "SEARCH_WINDOW_LIMIT", "SyncReport", "WATERMARK_REWIND_MS", "cursor", "normalise_record", "refresh_associations",
     "refresh_owners", "refresh_pipelines", "set_cursor", "set_watermark",
     "sync_incremental", "to_epoch_ms", "watermark",
 ]
@@ -33,6 +38,11 @@ __all__ = [
 # Rewind applied to the stored watermark when reading, for clock skew and
 # same-millisecond writes.
 WATERMARK_REWIND_MS = 60_000
+
+# The search endpoint caps at ~10,000 results per query, so a window is cut off
+# well short of it and re-opened from the newest record seen.
+SEARCH_RESULT_CAP = 10_000
+SEARCH_WINDOW_LIMIT = 9_000
 
 # Types the modified-date search can walk. Owners have no /search endpoint and
 # pipelines are two small requests, so both are refreshed in full every run.
@@ -199,8 +209,13 @@ def _complete_type(conn: sqlite3.Connection, object_type: str,
 
 
 def _sync_one_type(conn: sqlite3.Connection, client,
-                   object_type: str) -> tuple[int, list[str]]:
-    """Page the modified-date search to exhaustion. Returns (count, ids seen)."""
+                   object_type: str) -> tuple[int, list[str], int]:
+    """Page the modified-date search to exhaustion.
+
+    Returns (count, ids seen, max modified). It deliberately does *not* advance
+    the watermark: the caller does that only once the associations for these
+    records have landed too.
+    """
     table = table_for(object_type)
     stored = watermark(conn, object_type)
     since_ms = max(stored - WATERMARK_REWIND_MS, 0)
@@ -208,6 +223,7 @@ def _sync_one_type(conn: sqlite3.Connection, client,
     modified_column = MODIFIED_PROPERTY[object_type]
     max_modified = stored
     seen: list[str] = []
+    in_window = 0
 
     while True:
         page = client.search_modified_since(object_type, since_ms, after)
@@ -216,14 +232,29 @@ def _sync_one_type(conn: sqlite3.Connection, client,
             modified = row.get(modified_column)
             if modified is not None:
                 max_modified = max(max_modified, modified)
-        _write_page(conn, table, rows, object_type, page.after)
-        seen.extend(row["id"] for row in rows)
-        if page.after is None:
-            break
-        after = page.after
+        in_window += len(rows)
 
-    _complete_type(conn, object_type, max_modified)
-    return len(seen), seen
+        # The search endpoint refuses `after` beyond ~10,000 results. Because the
+        # client sorts ascending on the modified property, we can start a fresh
+        # window from the newest record seen instead of paging into the cap —
+        # gap-free, since `GT (max - 1)` re-reads the boundary millisecond.
+        restart = in_window >= SEARCH_WINDOW_LIMIT and page.after is not None
+        _write_page(conn, table, rows, object_type,
+                    None if restart else page.after)
+        seen.extend(row["id"] for row in rows)
+
+        if page.after is None:
+            return len(seen), seen, max_modified
+        if not restart:
+            after = page.after
+            continue
+
+        next_since = max(max_modified - 1, 0)
+        if next_since <= since_ms:
+            raise RuntimeError(
+                f"{object_type}: {in_window} records share one millisecond at "
+                f"{max_modified}; cannot advance past the search result cap")
+        since_ms, after, in_window = next_since, None, 0
 
 
 # --- full refreshes ----------------------------------------------------------
@@ -318,28 +349,58 @@ def refresh_associations(conn: sqlite3.Connection, client, object_type: str,
 
 # --- entry point -------------------------------------------------------------
 
+# A 4xx, or a record we cannot parse, is one type's problem and not the run's:
+# both are recorded and the remaining types still sync. RateLimited means the
+# backoff schedule was exhausted, so it propagates rather than hammering on.
+_TYPE_ERRORS = (httpx.HTTPStatusError, ValueError)
+
+
+def _refresh_reference_data(conn: sqlite3.Connection, client,
+                            report: SyncReport) -> None:
+    """Pipelines and owners are refreshed in full, and must not gate the
+    object sync they merely support, so even a RateLimited is recorded here."""
+    for name, refresh in (("pipelines", refresh_pipelines),
+                          ("owners", refresh_owners)):
+        try:
+            refresh(conn, client)
+        except (RateLimited, *_TYPE_ERRORS) as exc:
+            report.errors.append(f"{name}: {exc}")
+
+
+def _sync_object_type(conn: sqlite3.Connection, client, object_type: str,
+                      report: SyncReport) -> int:
+    """Pages, then associations, then — last — the watermarks."""
+    count, ids = 0, []
+    pending: list[tuple[str, int]] = []
+    try:
+        for api_type in api_types(object_type):
+            found, seen, max_modified = _sync_one_type(conn, client, api_type)
+            count += found
+            ids.extend(seen)
+            pending.append((api_type, max_modified))
+        # Associations land *before* the watermark moves. A record past the
+        # watermark is never searched again, so advancing first would strand
+        # stale association rows permanently if this refresh failed.
+        refresh_associations(conn, client, object_type, ids)
+        for api_type, max_modified in pending:
+            _complete_type(conn, api_type, max_modified)
+    except _TYPE_ERRORS as exc:
+        report.errors.append(f"{object_type}: {exc}")
+    return count
+
+
 def sync_incremental(conn: sqlite3.Connection, client,
                      object_types: list[str] | None = None) -> SyncReport:
     report = SyncReport()
-    refresh_pipelines(conn, client)
-    refresh_owners(conn, client)
-
-    for object_type in object_types or INCREMENTAL_TYPES:
+    requested = object_types or INCREMENTAL_TYPES
+    for object_type in requested:
         if object_type not in INCREMENTAL_TYPES:
-            # owners and pipelines have no search endpoint and are refreshed
-            # above; anything else is a caller mistake, not a silent no-op.
+            # owners and pipelines have no search endpoint and are refreshed in
+            # full; anything else is a caller mistake, not a silent no-op.
             raise ValueError(f"{object_type!r} cannot be synced incrementally")
-        count, ids = 0, []
-        try:
-            for api_type in api_types(object_type):
-                found, seen = _sync_one_type(conn, client, api_type)
-                count += found
-                ids.extend(seen)
-            refresh_associations(conn, client, object_type, ids)
-        except httpx.HTTPStatusError as exc:
-            # A 4xx is this type's problem, not the run's: record and continue.
-            # RateLimited means backoff was exhausted, and propagates.
-            report.errors.append(f"{object_type}: {exc}")
-        report.per_type[object_type] = count
 
+    _refresh_reference_data(conn, client, report)
+    for object_type in requested:
+        report.per_type[object_type] = _sync_object_type(
+            conn, client, object_type, report)
     return report

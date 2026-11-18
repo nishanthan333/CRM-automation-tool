@@ -1,11 +1,13 @@
 import sqlite3
 
+import httpx
 import pytest
 
-from crm.hubspot import ENGAGEMENT_TYPES, RateLimited
+from crm.hubspot import ENGAGEMENT_TYPES, Page, RateLimited
 from crm.sync import (
     WATERMARK_REWIND_MS,
     SyncReport,
+    _rewrite_pair,
     cursor,
     normalise_record,
     refresh_pipelines,
@@ -17,8 +19,17 @@ from crm.sync import (
 from tests.fakes import FakePage
 
 START = 1_700_000_000_000
+MOD_1_ISO = "2026-11-10T14:02:55.310Z"
+MOD_2_ISO = "2026-11-12T09:45:10.101Z"
 MOD_1 = 1_794_319_375_310  # 2026-11-10T14:02:55.310Z
 MOD_2 = 1_794_476_710_101  # 2026-11-12T09:45:10.101Z
+
+
+def http_error(status: int = 400) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "https://api.hubapi.com/crm/v3/x")
+    return httpx.HTTPStatusError(
+        f"HTTP {status}", request=request,
+        response=httpx.Response(status, request=request))
 
 
 def deal(deal_id: str, modified: str, **props) -> dict:
@@ -227,6 +238,116 @@ def test_rerun_after_crash_loses_no_record_and_duplicates_none(
     assert cursor(conn, "deals") is None
 
 
+# --- the watermark waits for the associations ---------------------------------
+
+def test_watermark_unmoved_when_association_refresh_raises(conn, fake_client):
+    """A record past the watermark is never searched again, so its association
+    rows would stay stale for good if the watermark advanced first."""
+    set_watermark(conn, "deals", START)
+    two_deal_pages(fake_client)
+
+    def boom(from_type, to_type, ids):
+        raise RateLimited("fake 429 on associations")
+
+    fake_client.batch_associations = boom
+    with pytest.raises(RateLimited):
+        sync_incremental(conn, fake_client, ["deals"])
+    assert watermark(conn, "deals") == START
+
+
+def test_watermark_unmoved_when_association_refresh_is_a_recorded_error(
+        conn, fake_client):
+    set_watermark(conn, "deals", START)
+    two_deal_pages(fake_client)
+
+    def boom(from_type, to_type, ids):
+        raise http_error(400)
+
+    fake_client.batch_associations = boom
+    report = sync_incremental(conn, fake_client, ["deals"])
+    assert watermark(conn, "deals") == START
+    assert report.errors and report.errors[0].startswith("deals:")
+
+
+def test_watermark_advances_once_associations_land(conn, fake_client):
+    set_watermark(conn, "deals", START)
+    two_deal_pages(fake_client)
+    sync_incremental(conn, fake_client, ["deals"])
+    assert watermark(conn, "deals") == MOD_2
+
+
+# --- the ~10,000 result search cap --------------------------------------------
+
+def test_search_window_restarts_before_the_result_cap(
+        conn, fake_client, monkeypatch):
+    monkeypatch.setattr("crm.sync.SEARCH_WINDOW_LIMIT", 1)
+    set_watermark(conn, "deals", START)
+    served, checkpoints = [], []
+
+    def search(object_type, since_ms, after):
+        served.append((since_ms, after))
+        checkpoints.append(cursor(conn, object_type))
+        if len(served) == 1:
+            return Page(records=[deal("4001", MOD_1_ISO)], after="page-2-cursor")
+        return Page(records=[deal("4002", MOD_2_ISO)], after=None)
+
+    fake_client.search_modified_since = search
+    sync_incremental(conn, fake_client, ["deals"])
+
+    # the capped window is abandoned for a fresh search, not paged into the cap
+    assert served == [(START - WATERMARK_REWIND_MS, None), (MOD_1 - 1, None)]
+    assert checkpoints[1] is None  # the stale cursor was cleared durably
+    assert watermark(conn, "deals") == MOD_2
+    assert [r["id"] for r in conn.execute("select id from deals order by id")] \
+        == ["4001", "4002"]
+
+
+def test_a_window_that_cannot_advance_fails_loudly(
+        conn, fake_client, monkeypatch):
+    monkeypatch.setattr("crm.sync.SEARCH_WINDOW_LIMIT", 1)
+    calls = []
+
+    def search(object_type, since_ms, after):
+        calls.append(after)
+        # bounded, so a sync that pages on forever fails instead of hanging
+        assert len(calls) <= 10, "paged past the cap instead of re-windowing"
+        return Page(records=[deal("4001", MOD_1_ISO)], after="next")
+
+    fake_client.search_modified_since = search
+    with pytest.raises(RuntimeError, match="search result cap"):
+        sync_incremental(conn, fake_client, ["deals"])
+
+
+# --- one type's failure is not the run's --------------------------------------
+
+def test_reference_data_failure_does_not_gate_the_object_sync(
+        conn, fake_client):
+    two_deal_pages(fake_client)
+
+    def boom(object_type, after, archived=False):
+        raise RateLimited("fake 429 on owners")
+
+    fake_client.list_page = boom
+    report = sync_incremental(conn, fake_client, ["deals"])
+    assert report.per_type == {"deals": 2}
+    assert any(e.startswith("owners:") for e in report.errors)
+    assert conn.execute("select count(*) from deals").fetchone()[0] == 2
+
+
+def test_a_malformed_date_is_confined_to_its_own_type(conn, fake_client):
+    fake_client.set_pages("deals", [FakePage(records=[
+        deal("4001", "not-a-date")])])
+    fake_client.set_pages("companies", [FakePage(records=[
+        {"id": "7001", "properties": {"name": "Acme",
+                                      "hs_lastmodifieddate": MOD_1_ISO}}])])
+    report = sync_incremental(conn, fake_client, ["deals", "companies"])
+
+    assert any(e.startswith("deals:") for e in report.errors)
+    assert watermark(conn, "deals") == 0
+    assert conn.execute("select count(*) from companies").fetchone()[0] == 1
+    assert watermark(conn, "companies") == MOD_1
+
+
 # --- pipelines and owners -----------------------------------------------------
 
 def test_pipelines_refreshed_on_every_run(conn, fake_client):
@@ -308,6 +429,47 @@ def test_associations_untouched_for_records_that_did_not_change(
     ]
 
 
+def test_reverse_side_links_are_stored_in_the_canonical_direction(
+        conn, fake_client):
+    """A changed contact is on the `to` side of both its pairs: the rows it
+    writes must still read as deals -> contacts and companies -> contacts,
+    which is what makes "whose deals are these" answerable."""
+    fake_client.set_pages("contacts", [FakePage(records=[
+        {"id": "5001", "properties": {"firstname": "Ada",
+                                      "lastmodifieddate": MOD_1_ISO}}])])
+    fake_client.associations[("contacts", "deals")] = {"5001": ["4001"]}
+    fake_client.associations[("contacts", "companies")] = {"5001": ["7001"]}
+    sync_incremental(conn, fake_client, ["contacts"])
+    assert assoc_rows(conn, "contacts") == [
+        ("deals", "4001", "contacts", "5001"),
+        ("companies", "7001", "contacts", "5001"),
+    ]
+
+
+def test_reverse_side_rewrite_replaces_only_that_records_links(
+        conn, fake_client):
+    with conn:
+        conn.execute("insert into associations values ('deals','4001','contacts','5001')")
+        conn.execute("insert into associations values ('deals','4009','contacts','5001')")
+    fake_client.set_pages("contacts", [FakePage(records=[
+        {"id": "5001", "properties": {"firstname": "Ada",
+                                      "lastmodifieddate": MOD_1_ISO}}])])
+    fake_client.associations[("contacts", "deals")] = {"5001": ["4002"]}
+    sync_incremental(conn, fake_client, ["contacts"])
+    assert assoc_rows(conn, "contacts") == [("deals", "4002", "contacts", "5001")]
+
+
+def test_rewriting_one_pair_leaves_the_records_other_pair_alone(conn):
+    """`_rewrite_pair` directly: the delete must be scoped to its own pair, or
+    rewriting a deal's company links silently drops its contact links."""
+    with conn:
+        conn.execute("insert into associations values ('deals','4001','companies','9')")
+        conn.execute("insert into associations values ('deals','4001','contacts','8')")
+    _rewrite_pair(conn, ("deals", "companies"), "deals", {"4001": ["10"]})
+    assert assoc_rows(conn, "companies") == [("deals", "4001", "companies", "10")]
+    assert assoc_rows(conn, "contacts") == [("deals", "4001", "contacts", "8")]
+
+
 def test_only_the_three_signal_pairs_are_refetched(conn, fake_client):
     two_deal_pages(fake_client)
     fake_client.set_pages("companies", [FakePage(records=[
@@ -336,6 +498,9 @@ def test_engagement_associations_not_bulk_synced(conn, fake_client):
                for c in fake_client.assoc_calls)
     assert conn.execute(
         "select count(*) from engagements").fetchone()[0] == len(ENGAGEMENT_TYPES)
+    # each endpoint's rows carry that endpoint's name, not one shared value
+    stored = {row["type"] for row in conn.execute("select type from engagements")}
+    assert stored == set(ENGAGEMENT_TYPES)
 
 
 # --- report -------------------------------------------------------------------

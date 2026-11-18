@@ -19,7 +19,6 @@ A NULL amount or owner is data, not an error: the record is still flagged, adds
 nothing to totals, and a NULL owner rolls up under "Unassigned".
 """
 
-from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone, tzinfo
 import sqlite3
@@ -351,27 +350,21 @@ def briefing(conn: sqlite3.Connection, now_ms: int) -> list[SignalSummary]:
 
     Order: severity (high first), then value at stake, then count. Per-signal
     figures are per-signal; for a day-level total use `total_at_risk`.
-    """
-    by_signal: dict[str, list[sqlite3.Row]] = defaultdict(list)
-    for row in flagged_records(conn, now_ms):
-        by_signal[row["signal_id"]].append(row)
 
+    A thin wrapper over `owner_rollups`, which is the same aggregation in SQL
+    and is what the signal page already uses. Grouping hundreds of thousands of
+    flag rows in Python, twice per render, was both slower than the SQL and a
+    second code path computing the same numbers.
+    """
     out = []
     for sig in _ENABLED:
-        rows = by_signal.get(sig.id)
-        if not rows:
+        by_owner = owner_rollups(conn, now_ms, sig.id)
+        if not by_owner:
             continue
-        owners: dict[str | None, OwnerRollup] = {}
-        for r in rows:
-            rollup = owners.setdefault(
-                r["owner_id"], OwnerRollup(r["owner_id"], _owner_label(r), 0, 0.0))
-            rollup.count += 1
-            rollup.total_value += r["value"] or 0.0
-        by_owner = sorted(owners.values(),
-                          key=lambda o: (-o.total_value, -o.count, o.label))
         out.append(SignalSummary(
             signal_id=sig.id, title=sig.title, severity=sig.severity,
-            count=len(rows), total_value=sum(r["value"] or 0.0 for r in rows),
+            count=sum(o.count for o in by_owner),
+            total_value=sum(o.total_value for o in by_owner),
             by_owner=by_owner))
     out.sort(key=lambda s: (SEVERITY_RANK[s.severity], -s.total_value,
                             -s.count, s.signal_id))
@@ -384,14 +377,23 @@ def total_at_risk(conn: sqlite3.Connection, now_ms: int | None = None) -> float:
     Signals overlap by design (a deal can be both stalled and big-and-quiet), so
     this sums over distinct deal ids. Only deal flags carry money: a company's
     value is its deals' amounts, which are already counted. A NULL amount counts
-    as 0. Pass `now_ms` to leave snoozed flags out, matching the briefing.
+    as 0, and so does a negative one, as when this grouped in Python. Pass
+    `now_ms` to leave snoozed flags out, matching the briefing.
     """
-    per_deal: dict[str, float] = {}
-    for r in flagged_records(conn, now_ms):
-        if r["record_type"] == "deals":
-            per_deal[r["record_id"]] = max(
-                per_deal.get(r["record_id"], 0.0), r["value"] or 0.0)
-    return float(sum(per_deal.values()))
+    params: dict = {f"s{n}": sig.id for n, sig in enumerate(_ENABLED)}
+    names = ", ".join(f":{name}" for name in params)
+    join, visible = "", ""
+    if now_ms is not None:
+        join, visible = _SNOOZE_JOIN, " AND z.signal_id IS NULL"
+        params["now_ms"] = now_ms
+    # max(mx, 0.0) is sqlite's two-argument scalar max, not the aggregate.
+    total = conn.execute(f"""
+SELECT COALESCE(SUM(max(mx, 0.0)), 0.0) AS total FROM (
+  SELECT MAX(COALESCE(r.value, 0.0)) AS mx
+  FROM signal_results r {join}
+  WHERE r.record_type = 'deals' AND r.signal_id IN ({names}){visible}
+  GROUP BY r.record_id)""", params).fetchone()["total"]
+    return float(total)
 
 
 # --- narrow reads for the dashboard's drill-downs --------------------------------

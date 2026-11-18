@@ -6,8 +6,8 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from crm.signals import (
-    SIGNALS, OwnerRollup, briefing, evaluate_all, explain, flagged_records,
-    total_at_risk,
+    SIGNALS, UNASSIGNED, OwnerRollup, briefing, evaluate_all, explain,
+    flagged_records, total_at_risk,
 )
 from tests.conftest import (
     DAY, DEFAULT_THRESHOLDS, NOW, UTC, add_company, add_deal, add_owner,
@@ -341,6 +341,88 @@ def test_briefing_reads_only_signal_results(conn):
     with conn:
         conn.execute("DELETE FROM deals")
     assert [s.signal_id for s in briefing(conn, NOW)] == ["stalled_deal"]
+
+
+def _reference_briefing(conn, now_ms):
+    """The aggregation the index used to do in Python, kept here as the oracle:
+    every visible flag row pulled and grouped by hand."""
+    from collections import defaultdict
+    by_signal = defaultdict(list)
+    for row in flagged_records(conn, now_ms):
+        by_signal[row["signal_id"]].append(row)
+    out = []
+    for sig in [s for s in SIGNALS if s.enabled]:
+        rows = by_signal.get(sig.id)
+        if not rows:
+            continue
+        owners = {}
+        for r in rows:
+            label = (UNASSIGNED if r["owner_id"] is None else
+                     " ".join(p for p in (r["first_name"], r["last_name"]) if p)
+                     or r["email"] or r["owner_id"])
+            o = owners.setdefault(r["owner_id"],
+                                  OwnerRollup(r["owner_id"], label, 0, 0.0))
+            o.count += 1
+            o.total_value += r["value"] or 0.0
+        out.append((sig.id, len(rows), sum(r["value"] or 0.0 for r in rows),
+                    sorted(owners.values(),
+                           key=lambda o: (-o.total_value, -o.count, o.label))))
+    rank = {"high": 0, "medium": 1, "low": 2}
+    severity = {s.id: s.severity for s in SIGNALS}
+    out.sort(key=lambda s: (rank[severity[s[0]]], -s[2], -s[1], s[0]))
+    return out
+
+
+def _reference_total_at_risk(conn, now_ms=None):
+    per_deal = {}
+    for r in flagged_records(conn, now_ms):
+        if r["record_type"] == "deals":
+            per_deal[r["record_id"]] = max(
+                per_deal.get(r["record_id"], 0.0), r["value"] or 0.0)
+    return float(sum(per_deal.values()))
+
+
+def _mixed_flags(conn):
+    """Several signals, several owners, an unowned record, a NULL amount and a
+    company flag, so every branch of the rollup is exercised."""
+    add_owner(conn, "o1", "Rhea", "Mehta")
+    add_owner(conn, "o2", "", "", email="sam@example.com")
+    add_deal(conn, "d_big", owner="o1", amount=200000, activity=days_ago(20))
+    add_deal(conn, "d_small", owner="o2", amount=1000, activity=days_ago(20))
+    add_deal(conn, "d_null", owner="o2", amount=None, activity=days_ago(20))
+    add_deal(conn, "d_none", owner=None, amount=7000, activity=days_ago(20),
+             closedate=days_ago(2))
+    add_company(conn, "c1", owner="o1", activity=days_ago(90),
+                open_deals=["d_big"])
+    evaluate(conn)
+
+
+def test_briefing_matches_the_python_aggregation_it_replaced(conn):
+    _mixed_flags(conn)
+    expected = _reference_briefing(conn, NOW)
+    actual = [(s.signal_id, s.count, s.total_value, s.by_owner)
+              for s in briefing(conn, NOW)]
+    assert actual == expected
+    assert [o.label for s in briefing(conn, NOW) for o in s.by_owner]
+    assert UNASSIGNED in [o.label for s in briefing(conn, NOW)
+                          for o in s.by_owner]
+    assert total_at_risk(conn, NOW) == _reference_total_at_risk(conn, NOW)
+    assert total_at_risk(conn) == _reference_total_at_risk(conn)
+
+
+def test_the_index_aggregates_in_sql_not_by_loading_every_flag(conn, monkeypatch):
+    """`briefing` and `total_at_risk` must not pull the whole flag table: at
+    day-one thresholds that is hundreds of thousands of rows per render."""
+    from crm import signals as module
+    _mixed_flags(conn)
+    monkeypatch.setattr(module, "flagged_records", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("loaded every flag row to build the index")))
+    out = briefing(conn, NOW)
+    assert [s.signal_id for s in out][0] == "stalled_deal"
+    assert "past_close_date" in [s.signal_id for s in out]
+    assert (out[0].count, out[0].total_value) == (4, 208000.0)
+    assert total_at_risk(conn, NOW) == 208000.0
+    assert total_at_risk(conn) == 208000.0
 
 
 def snooze(conn, signal_id, record_id, until, record_type="deals"):

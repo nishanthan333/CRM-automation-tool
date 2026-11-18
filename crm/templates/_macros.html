@@ -1,0 +1,10 @@
+{# A signal's rule in plain English plus the exact SQL that produced it. #}
+{% macro rule(sig, sql_open=false) %}
+<div class="rule">
+  <p>{{ sig.rule }}</p>
+  {% if sig.params %}<p class="muted">Thresholds (signals.toml):
+    {% for k, v in sig.params.items() %}<code>{{ k }} = {{ v }}</code>{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
+  <details class="sql"{% if sql_open %} open{% endif %}><summary>The SQL that produced this</summary>
+  <pre>{{ sig.sql }}</pre></details>
+</div>
+{% endmacro %}

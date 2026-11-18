@@ -16,5 +16,8 @@ dev = ["pytest"]
 [tool.setuptools]
 packages = ["crm"]
 
+[tool.setuptools.package-data]
+crm = ["templates/*.html", "static/*.css"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+{% from "_macros.html" import rule %}
+{% block content %}
+{% if empty %}
+<section class="empty">
+  <h1>No data yet</h1>
+  <p>Nothing has been pulled from HubSpot into the local database. Run
+  <code>watchdog sync --backfill</code> in a terminal to load your history
+  (it checkpoints, so it is safe to interrupt and resume), then reload this page.</p>
+</section>
+{% else %}
+<section class="briefing">
+  <h1>Needs attention</h1>
+  {% if cards %}
+  <p class="totals">{{ "{:,}".format(total_flags) }} flag{{ "" if total_flags == 1 else "s" }}
+    {% if total_at_risk %}· {{ total_at_risk|money }} at risk{% endif %}</p>
+  {% for c in cards %}
+  <details class="card sev-{{ c.severity }}"{% if loop.first %} open{% endif %}>
+    <summary>
+      <span class="card-title">{{ c.title }}</span>
+      <span class="card-figs">{{ "{:,}".format(c.count) }}{% if c.value %} · {{ c.value|money }}{% endif %}</span>
+      <span class="badge">{{ c.severity|upper }}</span>
+    </summary>
+    <ul class="owners">
+      {% for o in c.owners %}
+      <li><a href="/signal/{{ c.id }}?owner={{ (o.owner_id or '_none')|urlencode }}">{{ o.label }}</a>
+        <span class="muted">{{ "{:,}".format(o.count) }}{% if o.total_value %} · {{ o.total_value|money }}{% endif %}</span></li>
+      {% endfor %}
+      {% if c.more_owners %}<li class="muted">… {{ c.more_owners }} more owner{{ "" if c.more_owners == 1 else "s" }}</li>{% endif %}
+    </ul>
+    {{ rule(c) }}
+    <p><a href="/signal/{{ c.id }}">All {{ "{:,}".format(c.count) }} records →</a></p>
+  </details>
+  {% endfor %}
+  {% else %}
+  <p>Nothing is flagged.{% if not signals_ran %} Signals have not been evaluated yet: press <em>Sync now</em>.{% endif %}</p>
+  {% endif %}
+  {% if clear %}<p class="muted clear">Checked, nothing flagged: {{ clear|join(", ") }}.</p>{% endif %}
+</section>
+
+<section class="pipeline">
+  <h2>Pipeline</h2>
+  <form method="get" action="/" class="inline">
+    <label>Owner <select name="owner">
+      <option value="">All owners</option>
+      <option value="_none"{% if owner == '_none' %} selected{% endif %}>Unassigned</option>
+      {% for id, label in owners %}<option value="{{ id }}"{% if owner == id %} selected{% endif %}>{{ label }}</option>{% endfor %}
+    </select></label>
+    <button type="submit">Filter</button>
+  </form>
+  {% for p in pipeline %}
+  <h3>{{ p.name }}</h3>
+  <ul class="bars">
+    {% for s in p.stages %}
+    <li><span class="stage">{{ s.stage }}</span>
+      <span class="bar"><span style="width: {{ s.pct }}%"></span></span>
+      <span class="muted">{{ "{:,}".format(s.count) }} deal{{ "" if s.count == 1 else "s" }} · {{ s.value|money }}</span></li>
+    {% endfor %}
+  </ul>
+  {% else %}<p class="muted">No pipeline stages synced yet.</p>{% endfor %}
+</section>
+
+<section class="ask" id="ask">
+  <h2>Ask the data</h2>
+  <form method="post" action="/ask#ask">
+    <input type="text" name="question" value="{{ question }}" maxlength="2000" size="70"
+      placeholder="which deals died after the demo stage last quarter?" aria-label="Question">
+    <button type="submit">Ask</button>
+  </form>
+  <p class="muted">A local model writes the SQL from table and column names only. It is shown here, and it only ever runs read-only.</p>
+  {% if ask %}
+    {% if ask.error %}
+      <p class="banner warn" role="alert">{{ ask.error }}</p>
+      {% if ask.sql %}<h3>What the model produced</h3><pre>{{ ask.sql }}</pre>{% endif %}
+    {% else %}
+      <h3>Generated SQL</h3>
+      <pre>{{ ask.sql }}</pre>
+      <h3>Results</h3>
+      {% if ask.rows %}
+      <table>
+        <thead><tr>{% for c in ask.columns %}<th>{{ c }}</th>{% endfor %}</tr></thead>
+        <tbody>{% for row in ask.rows %}<tr>{% for cell in row %}<td>{{ "" if cell is none else cell }}</td>{% endfor %}</tr>{% endfor %}</tbody>
+      </table>
+      {% if ask.truncated %}<p class="muted">Showing the first {{ ask.rows|length }} rows only.</p>{% endif %}
+      {% else %}<p class="muted">The query returned no rows.</p>{% endif %}
+    {% endif %}
+  {% endif %}
+</section>
+{% endif %}
+{% endblock %}

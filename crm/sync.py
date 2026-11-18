@@ -32,6 +32,7 @@ from crm.hubspot import (
     RateLimited,
 )
 from crm.signals import evaluate_all
+from crm.snooze import drop_stale_snoozes
 
 __all__ = [
     "reconcile", "sync_archived",
@@ -424,6 +425,8 @@ def _sync_object_type(conn: sqlite3.Connection, client, object_type: str,
             count += found
             ids.extend(seen)
             pending.append((api_type, max_modified))
+            # A new amount/stage/owner voids a snooze; runs before evaluation.
+            drop_stale_snoozes(conn, table_for(api_type), seen)
         # Associations land *before* the watermark moves. A record past the
         # watermark is never searched again, so advancing first would strand
         # stale association rows permanently if this refresh failed.

@@ -523,3 +523,28 @@ def test_scheduled_sync_runs_the_weekly_pass_when_it_falls_due(home, client):
     cli.scheduled_sync(cfg_for(home))             # not due again for a week
     assert client.ids_only_calls == []
     assert not any(c.archived for c in client.list_calls)
+
+
+# --- signals.toml is an expected place for a typo ----------------------------
+
+def write_thresholds(home, body):
+    (home / "signals.toml").write_text("[thresholds]\n" + body)
+
+
+def test_a_mistyped_threshold_key_fails_before_any_hubspot_work(home, client, capsys):
+    write_thresholds(home, "stalled_dayz = 14\nbig_deal_quiet_days = 7\n"
+                           "big_deal_value = 50000\nuntouched_account_days = 30\n"
+                           "quiet_pipeline_drop_pct = 40\n")
+    assert main(["sync"]) == 2
+    err = capsys.readouterr().err
+    assert "stalled_days" in err and "stalled_deal" in err
+    assert "stalled_dayz" in err                 # names the typo it found
+    assert client.search_calls == [] and client.list_calls == []
+
+
+def test_a_non_numeric_threshold_is_rejected(home, client, capsys):
+    write_thresholds(home, 'stalled_days = "fourteen"\nbig_deal_quiet_days = 7\n'
+                           "big_deal_value = 50000\nuntouched_account_days = 30\n"
+                           "quiet_pipeline_drop_pct = 40\n")
+    assert main(["sync"]) == 2
+    assert "stalled_days" in capsys.readouterr().err

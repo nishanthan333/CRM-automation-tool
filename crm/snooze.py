@@ -74,16 +74,24 @@ def active_snoozes(conn: sqlite3.Connection,
         (now_ms,))}
 
 
-def drop_stale_snoozes(conn: sqlite3.Connection) -> int:
+def drop_stale_snoozes(conn: sqlite3.Connection,
+                       now_ms: int | None = None) -> int:
     """Delete every snooze whose record's material fields have since changed.
 
     Checks all snoozed rows, so it does not matter which path (incremental,
     backfill, reconcile) changed the record. Returns how many were dropped.
     A snooze with no stored fingerprint cannot be judged and is kept: that is
     the safe direction (at worst it expires on schedule).
+
+    Given `now_ms`, snoozes that have already expired are deleted first: they
+    hide nothing (the briefing's anti-join is on `until > now`) and would
+    otherwise be fingerprinted on every sync forever. The count returned is of
+    stale snoozes only; an expiry is not news.
     """
     dropped = 0
     with conn:
+        if now_ms is not None:
+            conn.execute("DELETE FROM snoozes WHERE until < ?", (now_ms,))
         for signal_id, record_type, record_id, stored in conn.execute(
                 "SELECT signal_id, record_type, record_id, fingerprint"
                 " FROM snoozes").fetchall():

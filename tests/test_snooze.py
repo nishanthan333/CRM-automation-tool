@@ -183,3 +183,21 @@ def test_backfill_drops_snooze_on_material_change(conn, fake_client):
 def test_snooze_module_has_no_hubspot_dependency():
     source = Path(snooze_module.__file__).read_text()
     assert "httpx" not in source and "crm.hubspot" not in source
+
+
+def test_expired_snoozes_are_purged_so_the_table_does_not_grow_forever(conn):
+    stalled(conn)
+    add_deal(conn, "d2", activity=NOW - 20 * DAY)
+    snooze(conn, "stalled_deal", "deals", "d1", NOW - 1, NOW - DAY)
+    snooze(conn, "stalled_deal", "deals", "d2", NOW + WEEK_MS, NOW)
+    assert drop_stale_snoozes(conn, NOW) == 0        # neither went stale
+    assert {r[0] for r in conn.execute("SELECT record_id FROM snoozes")} == {"d2"}
+
+
+def test_a_sync_purges_expired_snoozes(conn, fake_client):
+    from tests.conftest import mark_backfilled
+    stalled(conn)
+    mark_backfilled(conn)
+    snooze(conn, "stalled_deal", "deals", "d1", NOW - 1, NOW - DAY)
+    sync_incremental(conn, fake_client, ["deals"])
+    assert conn.execute("SELECT count(*) FROM snoozes").fetchone()[0] == 0

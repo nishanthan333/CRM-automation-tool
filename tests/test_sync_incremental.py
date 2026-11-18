@@ -3,6 +3,7 @@ import sqlite3
 import httpx
 import pytest
 
+from crm import sync
 from crm.hubspot import ENGAGEMENT_TYPES, Page, RateLimited
 from crm.sync import (
     WATERMARK_REWIND_MS,
@@ -371,8 +372,11 @@ def test_a_window_that_cannot_advance_fails_loudly(
         return Page(records=[deal("4001", MOD_1_ISO)], after="next")
 
     fake_client.search_modified_since = search
+    # Loudly, but against the type: SearchWindowStuck is in _TYPE_ERRORS.
+    report = sync_incremental(conn, fake_client, ["deals"])
+    assert any("search result cap" in e for e in report.errors)
     with pytest.raises(RuntimeError, match="search result cap"):
-        sync_incremental(conn, fake_client, ["deals"])
+        sync._sync_one_type(conn, fake_client, "deals")
 
 
 # --- one type's failure is not the run's --------------------------------------
@@ -645,3 +649,24 @@ def _backfilled(request, conn):
     backfilled type opts out by name."""
     if "never_backfilled" not in request.node.name:
         mark_backfilled(conn)
+
+
+def test_a_type_wedged_on_the_result_cap_does_not_abort_the_run(conn, fake_client):
+    """The cap condition is one type's problem, like every other failure here:
+    it must not take the other types and the signal re-evaluation with it."""
+    fake_client.set_pages("companies", [FakePage(records=[
+        {"id": "7001", "properties": {"hs_lastmodifieddate": MOD_1_ISO}}])])
+    real = fake_client.search_modified_since
+
+    def search(object_type, since_ms, after):
+        if object_type != "deals":
+            return real(object_type, since_ms, after)
+        return Page(records=[deal("4001", MOD_1_ISO)], after="next")
+
+    fake_client.search_modified_since = search
+    report = sync_incremental(conn, fake_client, ["deals", "companies"])
+    assert any("search result cap" in e and e.startswith("deals:")
+               for e in report.errors)
+    assert report.per_type["companies"] == 1
+    assert conn.execute("SELECT count(*) FROM sync_state WHERE object_type ="
+                        " 'signals'").fetchone()[0] == 1

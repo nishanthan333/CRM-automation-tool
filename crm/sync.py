@@ -41,7 +41,8 @@ __all__ = [
     "never_backfilled", "weekly_pass", "archive_eligible", "backfill_state",
     "BACKFILL_ORDER", "Estimate", "backfill", "estimate_backfill",
     "ASSOCIATION_PAIRS", "INCREMENTAL_TYPES", "SEARCH_RESULT_CAP",
-    "SEARCH_WINDOW_LIMIT", "SyncReport", "WATERMARK_REWIND_MS", "cursor",
+    "SEARCH_WINDOW_LIMIT", "SearchWindowStuck", "SyncReport",
+    "WATERMARK_REWIND_MS", "cursor",
     "normalise_record", "refresh_associations", "refresh_owners",
     "refresh_account", "refresh_pipelines", "set_cursor", "set_watermark", "sync_incremental",
     "to_epoch_ms", "watermark",
@@ -92,6 +93,15 @@ _REAL_COLUMNS = {"amount_in_home_currency"}
 
 # Owners carry their fields at the top level, not under `properties`.
 _TOP_LEVEL = {"owners"}
+
+
+class SearchWindowStuck(RuntimeError):
+    """More records than a search window holds share one millisecond.
+
+    Near-impossible, and unfixable from here, but it is one type's problem like
+    every other failure in this layer: it is recorded against that type and the
+    remaining types, and the signal re-evaluation, still run.
+    """
 
 
 @dataclass
@@ -177,8 +187,9 @@ def _evaluate_signals(conn: sqlite3.Connection, complete: bool) -> None:
     """
     home = home_dir()
     tz, week = signal_settings(home / "config.toml")
-    # A new amount/stage/owner voids a snooze, whichever path wrote it.
-    drop_stale_snoozes(conn)
+    # A new amount/stage/owner voids a snooze, whichever path wrote it; an
+    # expired one is purged rather than re-checked for ever.
+    drop_stale_snoozes(conn, _now_ms())
     skip = frozenset() if complete else frozenset({"quiet_pipeline"})
     evaluate_all(conn, load_thresholds(home / "signals.toml"), _now_ms(),
                  tz=tz, week_starts_on=week, skip=skip)
@@ -311,7 +322,7 @@ def _sync_one_type(conn: sqlite3.Connection, client,
             since_ms, after, in_window, read = next_since, None, 0, 0
             continue
         if full and read >= SEARCH_WINDOW_LIMIT:
-            raise RuntimeError(
+            raise SearchWindowStuck(
                 f"{object_type}: {read} records share one millisecond at "
                 f"{max_modified}; cannot advance past the search result cap")
         after = page.after
@@ -426,7 +437,7 @@ def refresh_associations(conn: sqlite3.Connection, client, object_type: str,
 # A 4xx, or a record we cannot parse, is one type's problem and not the run's:
 # both are recorded and the remaining types still sync. RateLimited means the
 # backoff schedule was exhausted, so it propagates rather than hammering on.
-_TYPE_ERRORS = (httpx.HTTPStatusError, ValueError)
+_TYPE_ERRORS = (httpx.HTTPStatusError, ValueError, SearchWindowStuck)
 
 
 # Reference data refreshed in full every run, and what its failure costs.

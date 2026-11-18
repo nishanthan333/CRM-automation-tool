@@ -17,9 +17,11 @@ from pathlib import Path
 import httpx
 import uvicorn
 
-from crm.config import Config, home_dir, load_config, signal_settings
+from crm.config import (Config, home_dir, load_config, load_thresholds,
+                        signal_settings)
 from crm.db import connect, migrate
 from crm.hubspot import HubSpotClient, RateLimited
+from crm.signals import SIGNALS
 from crm.sync import (
     SEARCH_RESULT_CAP,
     SYNC_LOCK,
@@ -49,6 +51,40 @@ def make_client(cfg: Config) -> HubSpotClient:
 
 # --- configuration ------------------------------------------------------------
 
+def _check_thresholds(path: Path) -> None:
+    """Every threshold an enabled signal names must be there, and be a number.
+
+    Tuning signals.toml is the documented first task after a backfill, so a
+    typo is an expected input, not a crash: without this a missing key raised a
+    bare KeyError out of `evaluate_all`, with a traceback, at the *end* of a
+    sync — after all the HubSpot work.
+    """
+    try:
+        values = load_thresholds(path).get("thresholds") or {}
+    except (ValueError, OSError) as exc:   # TOMLDecodeError is a ValueError
+        raise CliError(f"{path}: {exc}") from exc
+    needed: dict[str, list[str]] = {}
+    for sig in SIGNALS:
+        for name in (sig.thresholds if sig.enabled else ()):
+            needed.setdefault(name, []).append(sig.id)
+    problems = []
+    for name, signal_ids in sorted(needed.items()):
+        wanted = f"{name} (needed by {', '.join(sorted(signal_ids))})"
+        if name not in values:
+            problems.append(f"missing {wanted}")
+        elif isinstance(values[name], bool) or not isinstance(
+                values[name], (int, float)):
+            problems.append(f"{wanted} must be a number, "
+                            f"got {values[name]!r}")
+    if not problems:
+        return
+    extra = sorted(set(values) - set(needed))
+    raise CliError(
+        f"{path}: " + "; ".join(problems)
+        + (f". Keys no signal uses: {', '.join(extra)}" if extra else "")
+        + ". Compare with the defaults `watchdog init` writes.")
+
+
 def _load(home: Path) -> Config:
     """Config for every command but init. Fails loudly: running on defaults
     would silently ignore the user's timezone and week start."""
@@ -64,6 +100,7 @@ def _load(home: Path) -> Config:
         signal_settings(config_path)       # validates timezone and week start
     except (ValueError, OSError) as exc:   # TOMLDecodeError is a ValueError
         raise CliError(f"{config_path}: {exc}") from exc
+    _check_thresholds(home / "signals.toml")
     if not cfg.db_path.is_absolute():
         cfg = dataclasses.replace(cfg, db_path=home / cfg.db_path)
     return cfg

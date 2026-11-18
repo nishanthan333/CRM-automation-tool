@@ -260,6 +260,10 @@ def cmd_reconcile(args, home: Path) -> int:
             print(f"{object_type}: archived listing held {count:,} records")
         for object_type, count in result.items():       # not dict(result):
             print(f"{object_type}: {count:,} newly archived")  # keeps .skipped
+        for object_type, count in result.unarchived.items():
+            if count:
+                print(f"{object_type}: {count:,} un-archived (live in HubSpot "
+                      "again)")
         for object_type, reason in result.skipped.items():
             print(f"SKIPPED {object_type}: {reason}")
         _say_errors(errors)

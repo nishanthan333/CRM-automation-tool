@@ -246,7 +246,7 @@ def test_reconcile_archives_only_for_complete_types_and_reports_skips(home, clie
     set_phase(conn, "complete", "companies")
     upsert(conn, "companies", [{"id": "c1", "archived": 0}, {"id": "c2", "archived": 0}])
     conn.close()
-    client.remote_ids["companies"] = ["c1"]
+    client.remote_ids["companies"] = ["c1", "unsynced"]
     client.counts["companies"] = 1
     assert main(["reconcile"]) == 1              # other types skipped: attention
     out = capsys.readouterr().out

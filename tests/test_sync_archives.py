@@ -49,15 +49,60 @@ def test_sync_archived_fans_out_engagements(conn, fake_client):
 def test_reconcile_archives_locals_absent_from_remote_id_set(conn, fake_client):
     upsert(conn, "deals", [{"id": "1"}, {"id": "2"}])
     complete(conn, "deals")
-    fake_client.remote_ids["deals"] = ["1"]
+    # "unsynced" is live in HubSpot but not local yet, so the walk is not short
+    # against the local live count; "2" is genuinely gone.
+    fake_client.remote_ids["deals"] = ["1", "unsynced"]
     assert reconcile(conn, fake_client)["deals"] == 1
     assert flags(conn) == {"1": 0, "2": 1}
+
+
+def test_reconcile_unarchives_a_record_hubspot_lists_as_live_again(conn, fake_client):
+    upsert(conn, "deals", [{"id": "1", "archived": 1}, {"id": "2", "archived": 1}])
+    complete(conn, "deals")
+    fake_client.remote_ids["deals"] = ["1"]     # restored in HubSpot
+    reconcile(conn, fake_client)
+    # "2" is in neither the live listing nor the local live set: left alone.
+    assert flags(conn) == {"1": 0, "2": 1}
+
+
+def test_reconcile_unarchive_is_scoped_per_engagement_type(conn, fake_client):
+    upsert(conn, "engagements", [
+        {"id": "1", "type": "calls", "archived": 1},
+        {"id": "2", "type": "notes", "archived": 1}])
+    complete(conn, "calls", "meetings", "emails", "notes", "tasks")
+    fake_client.remote_ids["calls"] = ["1"]
+    fake_client.remote_ids["notes"] = ["9"]     # a note id, not engagement "2"
+    reconcile(conn, fake_client)
+    assert flags(conn, "engagements") == {"1": 0, "2": 1}
+
+
+def test_reconcile_is_idempotent_in_both_directions(conn, fake_client):
+    upsert(conn, "deals", [{"id": "1"}, {"id": "2"}])
+    complete(conn, "deals")
+    fake_client.remote_ids["deals"] = ["1", "unsynced"]
+    assert reconcile(conn, fake_client)["deals"] == 1       # "2" archived
+    fake_client.remote_ids["deals"] = ["1", "2", "unsynced"]
+    result = reconcile(conn, fake_client)                   # "2" is back
+    assert result["deals"] == 0 and result.unarchived["deals"] == 1
+    assert flags(conn) == {"1": 0, "2": 0}
+
+
+def test_reconcile_baseline_falls_back_to_the_local_live_count(conn, fake_client):
+    # HubSpot's search total is capped, so it can report far fewer records than
+    # exist. A walk short against the *local* live rows is still truncated.
+    upsert(conn, "deals", [{"id": str(i)} for i in range(1, 101)])
+    complete(conn, "deals")
+    fake_client.remote_ids["deals"] = ["1", "2"]
+    fake_client.counts["deals"] = 2            # all the capped total can say
+    result = reconcile(conn, fake_client)
+    assert "deals" not in result and "truncated" in result.skipped["deals"]
+    assert set(flags(conn).values()) == {0}
 
 
 def test_reconcile_never_deletes_rows(conn, fake_client):
     upsert(conn, "deals", [{"id": "1"}, {"id": "2"}])
     complete(conn, "deals")
-    fake_client.remote_ids["deals"] = ["1"]
+    fake_client.remote_ids["deals"] = ["1", "unsynced"]
     reconcile(conn, fake_client)
     assert conn.execute("select count(*) from deals").fetchone()[0] == 2
 
@@ -113,7 +158,7 @@ def test_reconcile_scopes_engagement_ids_per_api_type(conn, fake_client):
         {"id": "3", "type": "notes"}])
     complete(conn, "calls", "meetings", "emails", "notes", "tasks")
     fake_client.remote_ids["calls"] = ["1"]
-    fake_client.remote_ids["notes"] = ["2"]
+    fake_client.remote_ids["notes"] = ["2", "unsynced"]
     assert reconcile(conn, fake_client)["engagements"] == 1
     assert flags(conn, "engagements") == {"1": 0, "2": 0, "3": 1}
 
@@ -191,7 +236,7 @@ def test_weekly_pass_runs_archived_only_for_complete_types(conn, fake_client):
     complete(conn, "companies")
     upsert(conn, "companies", [{"id": "c1", "archived": 0}, {"id": "c2", "archived": 0}])
     fake_client.archived["companies"] = [{"id": "c9"}]
-    fake_client.remote_ids["companies"] = ["c1"]
+    fake_client.remote_ids["companies"] = ["c1", "unsynced"]
     fake_client.counts["companies"] = 1
     result = weekly_pass(conn, fake_client)
     assert {c.object_type for c in fake_client.list_calls} == {"companies"}

@@ -558,15 +558,17 @@ RECONCILE_MIN_COVERAGE = 0.99
 
 
 class ReconcileResult(dict):
-    """{object_type: rows newly archived}, plus `skipped`: {object_type: reason}.
+    """{object_type: rows newly archived}, plus `skipped`: {object_type: reason}
+    and `unarchived`: {object_type: rows brought back}.
 
-    A type is in exactly one of the two, so a guarded or ungated type is never
-    mistaken for a clean zero.
+    A type is in exactly one of the mapping or `skipped`, so a guarded or
+    ungated type is never mistaken for a clean zero.
     """
 
     def __init__(self) -> None:
         super().__init__()
         self.skipped: dict[str, str] = {}
+        self.unarchived: dict[str, int] = {}
 
 
 def reconcile(conn: sqlite3.Connection, client) -> ReconcileResult:
@@ -575,18 +577,29 @@ def reconcile(conn: sqlite3.Connection, client) -> ReconcileResult:
     Catches *hard* deletes, which appear in neither the search nor the archived
     listing. Pages every id, so it is not a per-run operation.
 
+    The walk is the authoritative set of ids HubSpot currently lists as live,
+    so it is read in both directions: an id it holds that is archived locally
+    is un-archived. Without that the 1% tolerance below would be a one-way
+    ratchet — the incremental search only returns records modified since the
+    watermark, so a record wrongly archived here, or archived in HubSpot and
+    later restored, would never come back.
+
     Safety, since a wrong archive silently drops a live deal from the briefing:
     - only types whose backfill is `complete` are reconciled;
     - the local ids are snapshotted *before* the remote walk, so a record
       created during the (long) walk and synced locally meanwhile is never a
-      candidate;
+      candidate, and neither is one archived locally meanwhile;
     - the whole remote id set is collected before anything is written, so a
       failed walk (any exception, RateLimited included, which propagates)
-      archives nothing for that type;
-    - a walk that succeeds but is short (fewer ids than 99% of `client.count`,
-      or empty against live local rows) is treated as truncated and refused;
+      writes nothing for that type;
+    - a walk that succeeds but is short (fewer ids than 99% of the baseline,
+      or empty against live local rows) is treated as truncated and refused.
+      The baseline is `max(client.count, local live rows)`: the local count
+      costs no request and no `count` cap can shrink it, so a genuine
+      mass-archive in HubSpot trips the guard and is reported as a skip
+      rather than silently emptying the briefing;
     - an object type is written all-or-nothing across its api types;
-    - rows are never deleted, only `archived = 1`.
+    - rows are never deleted, only `archived` flipped.
     Types not reconciled are listed in `result.skipped` with a reason.
     """
     result = ReconcileResult()
@@ -596,28 +609,38 @@ def reconcile(conn: sqlite3.Connection, client) -> ReconcileResult:
             continue
         table = table_for(object_type)
         plan: list[tuple[str]] = []
+        revive: list[tuple[str]] = []
         reason = None
         for api_type in api_types(object_type):
-            where, params = "archived = 0", []
+            scope, params = "", []
             if table == "engagements":
-                where, params = "archived = 0 AND type = ?", [api_type]
+                scope, params = " AND type = ?", [api_type]
             local = [r["id"] for r in conn.execute(
-                f"SELECT id FROM {table} WHERE {where}", params)]
+                f"SELECT id FROM {table} WHERE archived = 0{scope}", params)]
+            archived_local = [r["id"] for r in conn.execute(
+                f"SELECT id FROM {table} WHERE archived = 1{scope}", params)]
             remote: set[str] = set()
             for page in _pages(lambda after: client.list_ids_page(api_type, after)):
                 remote.update(str(r["id"]) for r in page.records)
-            expected = client.count(api_type)
+            counted = client.count(api_type)
+            expected = max(counted, len(local))
             if (not remote and local) or len(remote) < expected * RECONCILE_MIN_COVERAGE:
                 reason = (f"{api_type}: id walk returned {len(remote)} ids, "
-                          f"HubSpot counts {expected}; treated as truncated")
+                          f"HubSpot counts {counted} and {len(local)} live rows "
+                          "are held locally; treated as truncated")
                 break
             plan.extend((i,) for i in local if i not in remote)
+            # `remote` is the live listing only (archived=false), so a record
+            # HubSpot really has archived is absent from it and stays archived.
+            revive.extend((i,) for i in archived_local if i in remote)
         if reason:
             result.skipped[object_type] = reason
             continue
         with conn:
             conn.executemany(f"UPDATE {table} SET archived = 1 WHERE id = ?", plan)
+            conn.executemany(f"UPDATE {table} SET archived = 0 WHERE id = ?", revive)
         result[object_type] = len(plan)
+        result.unarchived[object_type] = len(revive)
     return result
 
 

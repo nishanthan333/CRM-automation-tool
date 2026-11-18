@@ -129,9 +129,11 @@ class HubSpotClient:
         )
 
     def count(self, object_type: str) -> int:
-        """Total records of a type. List responses carry no total; search's
-        `total` is the full match count (not capped at 10,000). A read-only
-        POST, and never paged. Owners have no /search endpoint."""
+        """Total records of a type, as HubSpot reports it. List responses carry
+        no total; search's `total` may be capped at 10,000, so a figure at that
+        ceiling means "at least N", not a count, and callers must treat it as a
+        floor. A read-only POST, and never paged. Owners have no /search
+        endpoint."""
         data = self._request(
             "POST", f"/crm/v3/objects/{object_type}/search", json={"limit": 1})
         return int(data["total"])

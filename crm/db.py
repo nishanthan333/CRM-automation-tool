@@ -78,8 +78,14 @@ CREATE INDEX IF NOT EXISTS idx_signal_results_signal ON signal_results(signal_id
 """
 
 
+BUSY_TIMEOUT_S = 60.0
+
+
 def connect(db_path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
+    # A sync holds the write lock across large transactions; a second process
+    # (a CLI run beside `serve`) waits this long for it rather than failing
+    # after sqlite's 5-second default.
+    conn = sqlite3.connect(db_path, timeout=BUSY_TIMEOUT_S)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")

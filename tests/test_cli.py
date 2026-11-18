@@ -276,7 +276,7 @@ def test_reconcile_zero_is_not_a_skip(home, client, capsys):
 # --- serve and the timer ---------------------------------------------------------
 
 class _Quiet:
-    def start(self): pass
+    def start(self, immediate=False): pass
     def stop(self): pass
 
 
@@ -286,13 +286,14 @@ def test_serve_starts_timer_at_configured_interval_and_binds_localhost(home, cli
     class Recorder:
         def __init__(self, interval_s, job, **kw):
             started.append(interval_s)
-        def start(self): run["started"] = True
+        def start(self, immediate=False): run["started"] = immediate
         def stop(self): run["stopped"] = True
 
     monkeypatch.setattr(cli, "SyncTimer", Recorder)
     monkeypatch.setattr(cli.uvicorn, "run", lambda app, **kw: run.update(kw))
     assert main(["serve"]) == 0
     assert started == [15 * 60]
+    assert run["started"] is True              # one sync at startup, not 15 min later
     assert run["host"] == "127.0.0.1"
     assert run["started"] and run["stopped"]
 
@@ -313,6 +314,12 @@ class FakeTimer:
 
     def start(self): pass
     def cancel(self): pass
+
+
+def test_timer_immediate_start_fires_now_then_every_interval():
+    FakeTimer.armed = []
+    SyncTimer(900, lambda: None, timer_factory=FakeTimer).start(immediate=True)
+    assert FakeTimer.armed == [0]
 
 
 def test_timer_job_survives_failure_and_rearms(caplog):
@@ -367,3 +374,101 @@ def test_scheduled_job_lets_a_rate_limit_reach_the_timer(home, client):
     client.set_pages("companies", 3)
     with pytest.raises(RateLimited):
         cli.scheduled_sync(cfg_for(home))
+
+
+def test_scheduled_job_skips_while_another_sync_holds_the_lock(home, client, caplog):
+    from crm.sync import SYNC_LOCK
+    conn = db(home)
+    complete_all(conn)
+    conn.close()
+    with SYNC_LOCK, caplog.at_level(logging.INFO, logger="watchdog"):
+        cli.scheduled_sync(cfg_for(home))
+    assert client.search_calls == []
+    assert "another sync is running" in caplog.text
+
+
+def test_scheduled_job_releases_the_lock_even_when_it_fails(home, client):
+    from crm.sync import SYNC_LOCK
+    conn = db(home)
+    complete_all(conn)
+    conn.close()
+    client.fail_on_page = 1
+    client.set_pages("companies", 3)
+    with pytest.raises(RateLimited):
+        cli.scheduled_sync(cfg_for(home))
+    assert SYNC_LOCK.acquire(blocking=False)
+    SYNC_LOCK.release()
+
+
+def test_http_error_names_the_url_and_status(home, client, capsys):
+    def boom(_type):
+        req = httpx.Request("POST", "https://api.hubapi.com/crm/v3/objects/deals/search")
+        raise httpx.HTTPStatusError("400", request=req,
+                                    response=httpx.Response(400, request=req))
+    client.count = boom
+    assert main(["estimate"]) == 1
+    err = capsys.readouterr().err
+    assert "400" in err and "/crm/v3/objects/deals/search" in err
+    assert "message above" not in err
+
+
+def test_only_a_locked_database_gets_the_other_process_hint(home, client, capsys, monkeypatch):
+    import sqlite3
+    for message, expect in (("database is locked", True), ("no such table: deals", False)):
+        def boom(*a, **k):
+            raise sqlite3.OperationalError(message)
+        monkeypatch.setattr(cli, "estimate_backfill", boom)
+        assert main(["estimate"]) == 1
+        err = capsys.readouterr().err
+        assert message in err
+        assert ("another watchdog process" in err.lower()) is expect
+
+
+def test_token_hint_needs_a_real_rejection_not_the_digits_401(home, client, capsys):
+    cli._say_errors(["deals: record 4010 failed; 401 records skipped"])
+    assert "rejected the token" not in capsys.readouterr().err
+    cli._say_errors(["deals: Client error '401 Unauthorized' for url 'https://x'"])
+    assert "rejected the token" in capsys.readouterr().err
+
+
+def test_blocked_by_a_rejected_token_says_so(home, client, capsys):
+    cli._say_blocked([("deals", "blocked: Client error '403 Forbidden' for url 'x'")])
+    assert "rejected the token" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("failure", [KeyboardInterrupt(), RateLimited("429")])
+def test_backfill_closes_its_connection_on_interrupt_and_rate_limit(
+        home, client, monkeypatch, failure):
+    opened = []
+    real_open = cli._open
+    monkeypatch.setattr(cli, "_open", lambda cfg: opened.append(real_open(cfg)) or opened[-1])
+
+    def fail(*a, **k):
+        raise failure
+    monkeypatch.setattr(cli, "backfill", fail)
+    assert main(["backfill"]) != 0
+    with pytest.raises(Exception, match="closed"):
+        opened[0].execute("select 1")
+
+
+def test_reconcile_prints_what_the_archived_listing_found(home, client, capsys):
+    conn = db(home)
+    set_phase(conn, "complete", "companies")
+    conn.close()
+    client.archived["companies"] = [{"id": "c9"}, {"id": "c8"}]
+    client.counts["companies"] = 0
+    main(["reconcile"])
+    assert "companies: archived listing held 2 records" in capsys.readouterr().out
+
+
+def test_unset_home_with_no_config_in_cwd_fails_loudly(tmp_path, client, monkeypatch, capsys):
+    monkeypatch.delenv("WATCHDOG_HOME")
+    monkeypatch.chdir(tmp_path)
+    assert main(["sync"]) == 2
+    assert "watchdog init" in capsys.readouterr().err
+    monkeypatch.delenv("WATCHDOG_HOME", raising=False)
+
+
+def test_connections_wait_for_the_write_lock_instead_of_failing_at_5s(tmp_path):
+    conn = connect(tmp_path / "x.db")
+    assert conn.execute("PRAGMA busy_timeout").fetchone()[0] >= 30_000

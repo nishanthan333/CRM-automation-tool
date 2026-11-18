@@ -184,3 +184,24 @@ def test_reconcile_engagements_all_or_nothing(conn, fake_client):
     result = reconcile(conn, fake_client)
     assert "engagements" in result.skipped
     assert flags(conn, "engagements") == {"1": 0, "2": 0}
+
+
+def test_weekly_pass_runs_archived_only_for_complete_types(conn, fake_client):
+    from crm.sync import weekly_pass
+    complete(conn, "companies")
+    upsert(conn, "companies", [{"id": "c1", "archived": 0}, {"id": "c2", "archived": 0}])
+    fake_client.archived["companies"] = [{"id": "c9"}]
+    fake_client.remote_ids["companies"] = ["c1"]
+    fake_client.counts["companies"] = 1
+    result = weekly_pass(conn, fake_client)
+    assert {c.object_type for c in fake_client.list_calls} == {"companies"}
+    assert result.archived_found == {"companies": 1}
+    assert result.reconciled["companies"] == 1
+    assert "deals" in result.reconciled.skipped
+
+
+def test_weekly_pass_with_nothing_complete_skips_the_archived_pass(conn, fake_client):
+    from crm.sync import weekly_pass
+    result = weekly_pass(conn, fake_client)
+    assert fake_client.list_calls == []
+    assert result.archived_found == {} and len(result.reconciled.skipped) == 4

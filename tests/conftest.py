@@ -136,3 +136,13 @@ def _watchdog_home(monkeypatch):
     monkeypatch.setenv(
         "WATCHDOG_HOME",
         str(Path(__file__).parent.parent / "crm" / "defaults"))
+
+
+def mark_backfilled(conn):
+    """Every type `complete`, as after a finished backfill. sync_incremental
+    refuses a type that was never backfilled."""
+    from crm.sync import BACKFILL_ORDER, _state_sql, api_types
+    with conn:
+        for object_type in BACKFILL_ORDER:
+            for t in api_types(object_type):
+                conn.execute(*_state_sql(t, {"phase": "complete"}))

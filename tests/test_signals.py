@@ -456,6 +456,8 @@ def test_failed_evaluation_leaves_previous_results_intact(conn):
 
 def test_incremental_sync_evaluates_signals(conn, fake_client):
     from crm.sync import sync_incremental
+    from tests.conftest import mark_backfilled
+    mark_backfilled(conn)
     add_deal(conn, "d_stale", activity=days_ago(400))
     sync_incremental(conn, fake_client, ["deals"])
     assert conn.execute(
@@ -491,9 +493,11 @@ def test_skipped_signal_keeps_its_previous_result_while_others_refresh(conn):
 def test_incremental_sync_skips_quiet_pipeline_and_records_partial_state(
         conn, fake_client):
     from crm.sync import sync_incremental
+    from tests.conftest import mark_backfilled
+    mark_backfilled(conn)
     with conn:
-        conn.execute("INSERT INTO sync_state (object_type, phase) VALUES"
-                     " ('companies', 'backfill')")
+        conn.execute("UPDATE sync_state SET phase = 'backfill'"
+                     " WHERE object_type = 'companies'")
     sync_incremental(conn, fake_client, ["deals"])
     row = conn.execute("SELECT phase, status FROM sync_state"
                        " WHERE object_type = 'signals'").fetchone()

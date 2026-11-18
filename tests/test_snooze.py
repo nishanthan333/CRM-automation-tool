@@ -157,6 +157,8 @@ def test_sync_incremental_noop_keeps_and_change_drops(conn, fake_client):
     def pages(**props):
         fake_client.set_pages("deals", [FakePage(records=[
             deal("4001", "2026-11-10T14:02:55.310Z", **props)])])
+    from tests.conftest import mark_backfilled
+    mark_backfilled(conn)
     pages()
     sync_incremental(conn, fake_client, ["deals"])
     snooze(conn, "stalled_deal", "deals", "4001", NOW + WEEK_MS, NOW)

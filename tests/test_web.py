@@ -359,6 +359,23 @@ def test_sync_crash_does_not_500(seeded, fake_client):
     assert r.status_code == 200 and "Sync failed" in r.text
 
 
+def test_sync_button_on_a_never_backfilled_database_walks_nothing(conn, fake_client):
+    c = build(conn, fake_client)
+    r = c.post("/sync", follow_redirects=True)
+    assert r.status_code == 200
+    assert fake_client.search_calls == []
+    assert "never backfilled" in r.text
+
+
+def test_sync_button_shares_its_lock_with_the_timer(seeded, fake_client):
+    from crm.sync import SYNC_LOCK
+    c = build(seeded, fake_client)
+    with SYNC_LOCK:
+        r = c.post("/sync", follow_redirects=True)
+    assert "already running" in r.text
+    assert fake_client.search_calls == []
+
+
 # --- same-origin guard -------------------------------------------------------------
 
 POSTS = [("/sync", {}), ("/ask", {"question": "x"}),

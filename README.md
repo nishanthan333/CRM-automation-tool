@@ -35,9 +35,12 @@ In HubSpot: Settings, Integrations, Private Apps, Create a private app. Give it
 | `crm.objects.owners.read` | owner names for the briefing |
 | `sales-email-read` | emails (the `emails` engagement type) |
 
-Copy the access token (`pat-...`). Scope names in HubSpot's UI change from time
-to time. If a command later reports **HTTP 403** for one object type, the
-private app is missing that object's read scope: add it and re-run.
+Copy the access token (`pat-...`). **Verify this list against your HubSpot UI**:
+scope names change from time to time, and it was not checked against a live
+portal. In particular, the account-info call that learns your portal id (used
+for record links) may need a scope this table omits. If a command reports
+**HTTP 403** for an object type or for account info, the private app is missing
+that read scope: add it and re-run.
 
 ### 2. `watchdog init`
 
@@ -128,12 +131,13 @@ type keeps the briefing's numbers for that object stale, so do not ignore it.
 watchdog serve            # http://127.0.0.1:8000  (--port N to change)
 ```
 
-Starts the dashboard and a background timer that runs an incremental sync every
-`interval_minutes`. A sync that fails (HubSpot down, rate limit, a locked
+Starts the dashboard and a background timer that runs an incremental sync at
+startup and then every `interval_minutes`. A sync that fails (HubSpot down, rate limit, a locked
 database) is logged and the next one still runs; one bad sync does not stop the
-rest. `serve` warns at startup if the backfill has not run, and until it has,
-scheduled syncs skip rather than quietly walking the whole account through the
-search endpoint.
+rest. Until the backfill has run, every sync (the timer, the dashboard's Sync
+now button, `watchdog sync`) refuses to sync a never-backfilled type, rather
+than quietly walking the whole account through the search endpoint; `serve`
+also warns at startup.
 
 Things to know:
 
@@ -145,6 +149,14 @@ Things to know:
 - **Record links appear after the first sync.** Links back to HubSpot need your
   portal id and UI domain (EU accounts are not `app.hubspot.com`), which a sync
   learns and stores. Until then a record page says so instead of linking.
+- **What is safe to run beside `serve`.** `watchdog estimate` always (it opens no
+  database). `watchdog sync` and `watchdog reconcile` also work, but they and
+  the server's own syncs write the same database, so one waits for the other
+  (up to 60 seconds before reporting "database is locked", after which just
+  retry). The timer and Sync now never overlap each other. `watchdog backfill`
+  beside `serve` is allowed and writes page by page, but while it runs the
+  server skips the types it is still loading. Never run two `serve` or two
+  `backfill` processes against one database directory.
 - The question box needs Ollama running locally with the model set under
   `[ollama]` in `config.toml`. Only read-only `SELECT`s run, and only against
   the local database.

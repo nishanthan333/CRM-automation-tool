@@ -24,8 +24,10 @@ class SyncTimer:
         self._timer = None
         self._stopped = False
 
-    def start(self) -> None:
-        self._arm()
+    def start(self, immediate: bool = False) -> None:
+        """Arm the first run; `immediate` makes it fire now rather than after
+        a full interval, so a freshly started server is not stale."""
+        self._arm(0 if immediate else self.interval_s)
 
     def stop(self) -> None:
         with self._lock:
@@ -33,11 +35,11 @@ class SyncTimer:
             if self._timer is not None:
                 self._timer.cancel()
 
-    def _arm(self) -> None:
+    def _arm(self, delay: float | None = None) -> None:
         with self._lock:
             if self._stopped:
                 return
-            self._timer = self._factory(self.interval_s, self._fire)
+            self._timer = self._factory(self.interval_s if delay is None else delay, self._fire)
             self._timer.daemon = True
             self._timer.start()
 

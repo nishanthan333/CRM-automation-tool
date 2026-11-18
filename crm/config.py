@@ -25,6 +25,12 @@ def load_config(path: Path) -> Config:
         raise ValueError("config: [hubspot] token is required")
     local = data.get("local", {})
     ollama = data.get("ollama", {})
+    if "REPLACE-ME" in token:
+        raise ValueError("config: [hubspot] token is still the placeholder; "
+                         "paste your private app's access token")
+    interval = int(data.get("sync", {}).get("interval_minutes", 15))
+    if interval < 1:
+        raise ValueError("config: [sync] interval_minutes must be >= 1")
     return Config(
         hubspot_token=token,
         db_path=Path(local.get("db_path", "data/crm.db")),
@@ -32,7 +38,7 @@ def load_config(path: Path) -> Config:
         week_starts_on=local.get("week_starts_on", "monday"),
         ollama_model=ollama.get("model", "qwen2.5-coder:7b"),
         ollama_url=ollama.get("url", "http://localhost:11434"),
-        sync_interval_minutes=int(data.get("sync", {}).get("interval_minutes", 15)),
+        sync_interval_minutes=interval,
     )
 
 

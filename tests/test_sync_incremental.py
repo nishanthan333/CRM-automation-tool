@@ -17,6 +17,7 @@ from crm.sync import (
     to_epoch_ms,
     watermark,
 )
+from tests.conftest import mark_backfilled
 from tests.fakes import FakePage
 
 START = 1_700_000_000_000
@@ -587,3 +588,21 @@ def test_engagement_counts_are_reported_under_one_type(conn, fake_client):
                             "hs_lastmodifieddate": "2026-11-03T15:20:41.100Z"}}])])
     report = sync_incremental(conn, fake_client, ["engagements"])
     assert report.per_type == {"engagements": len(ENGAGEMENT_TYPES)}
+
+
+def test_never_backfilled_type_is_not_synced_through_search(conn, fake_client):
+    from crm.sync import sync_incremental
+    fake_client.set_pages("deals", 1)
+    report = sync_incremental(conn, fake_client, ["deals"])   # phase is NULL
+    assert fake_client.search_calls == []
+    assert any("deals" in e and "never backfilled" in e for e in report.errors)
+    assert report.per_type["deals"] == 0
+    assert conn.execute("select count(*) from deals").fetchone()[0] == 0
+
+
+@pytest.fixture(autouse=True)
+def _backfilled(request, conn):
+    """Incremental sync needs completed backfills; the one test about a never
+    backfilled type opts out by name."""
+    if "never_backfilled" not in request.node.name:
+        mark_backfilled(conn)

@@ -14,7 +14,6 @@ import logging
 import math
 import re
 import sqlite3
-import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -37,7 +36,7 @@ from crm.hubspot import HubSpotClient
 from crm.signals import (SIGNALS, UNASSIGNED, briefing, explain, flagged_page,
                          flags_for_record, owner_rollups, total_at_risk)
 from crm.snooze import SNOOZE_FIELDS, snooze
-from crm.sync import sync_incremental
+from crm.sync import SYNC_LOCK, sync_incremental
 
 __all__ = ["LABELS", "PAGE_SIZE", "create_app"]
 
@@ -360,7 +359,7 @@ def create_app(cfg: Config, *, client=None, http=None,
                   openapi_url=None)
     app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
     app.state.notice = None
-    sync_lock = threading.Lock()
+    sync_lock = SYNC_LOCK   # shared with the serve timer
 
     @contextmanager
     def db():

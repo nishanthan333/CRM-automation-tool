@@ -15,6 +15,7 @@ Resume semantics, which the whole tool's trustworthiness rests on:
 import json
 import math
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -35,7 +36,8 @@ from crm.signals import evaluate_all
 from crm.snooze import drop_stale_snoozes
 
 __all__ = [
-    "reconcile", "sync_archived", "archive_eligible", "backfill_state",
+    "reconcile", "sync_archived", "SYNC_LOCK", "WeeklyResult", "blocked_types",
+    "never_backfilled", "weekly_pass", "archive_eligible", "backfill_state",
     "BACKFILL_ORDER", "Estimate", "backfill", "estimate_backfill",
     "ASSOCIATION_PAIRS", "INCREMENTAL_TYPES", "SEARCH_RESULT_CAP",
     "SEARCH_WINDOW_LIMIT", "SyncReport", "WATERMARK_REWIND_MS", "cursor",
@@ -461,6 +463,11 @@ def _sync_object_type(conn: sqlite3.Connection, client, object_type: str,
     return count
 
 
+# One incremental sync at a time per process: the dashboard's Sync now button
+# and the serve timer both take this, so they never overlap.
+SYNC_LOCK = threading.Lock()
+
+
 def sync_incremental(conn: sqlite3.Connection, client,
                      object_types: list[str] | None = None) -> SyncReport:
     report = SyncReport()
@@ -480,6 +487,14 @@ def sync_incremental(conn: sqlite3.Connection, client,
             # and advance the (provisional) watermark past unwalked records.
             report.errors.append(
                 f"{object_type}: backfill not complete; run backfill first")
+            report.per_type[object_type] = 0
+            continue
+        if not all(_is_complete(conn, t) for t in api_types(object_type)):
+            # Phase NULL: no list cursor exists, so a search run would walk the
+            # whole type through capped windows, a slow, wrong-shaped backfill.
+            report.errors.append(
+                f"{object_type}: never backfilled; run `watchdog estimate`, "
+                "then `watchdog backfill`")
             report.per_type[object_type] = 0
             continue
         synced = True
@@ -606,6 +621,28 @@ def reconcile(conn: sqlite3.Connection, client) -> ReconcileResult:
     return result
 
 
+@dataclass
+class WeeklyResult:
+    archived_found: dict[str, int] = field(default_factory=dict)
+    errors: list[str] = field(default_factory=list)
+    reconciled: ReconcileResult = field(default_factory=ReconcileResult)
+
+
+def weekly_pass(conn: sqlite3.Connection, client) -> WeeklyResult:
+    """The weekly operation: archived listing, then hard-delete reconcile.
+
+    The archived pass runs only for `archive_eligible` types. An empty list is
+    never passed on: `sync_archived` reads it as "every type".
+    """
+    result = WeeklyResult()
+    eligible = archive_eligible(conn)
+    if eligible:
+        report = sync_archived(conn, client, eligible)
+        result.archived_found, result.errors = report.per_type, report.errors
+    result.reconciled = reconcile(conn, client)
+    return result
+
+
 # --- backfill ----------------------------------------------------------------
 
 # Briefing objects first, so an interrupted backfill still leaves them usable;
@@ -635,6 +672,17 @@ def backfill_state(conn: sqlite3.Connection) -> dict[str, tuple[str | None, str 
     """
     return {t: (_state(conn, t, "phase"), _state(conn, t, "status"))
             for o in BACKFILL_ORDER for t in api_types(o)}
+
+
+def never_backfilled(conn: sqlite3.Connection) -> list[str]:
+    """api types whose phase is NULL: no backfill has ever started."""
+    return [t for t, (phase, _) in backfill_state(conn).items() if phase is None]
+
+
+def blocked_types(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+    """(api type, "blocked: <message>") for every blocked type."""
+    return [(t, status or "blocked") for t, (phase, status)
+            in backfill_state(conn).items() if phase == BLOCKED]
 
 
 def archive_eligible(conn: sqlite3.Connection) -> list[str]:

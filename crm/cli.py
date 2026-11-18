@@ -8,6 +8,7 @@ import argparse
 import dataclasses
 import logging
 import os
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -20,20 +21,20 @@ from crm.db import connect, migrate
 from crm.hubspot import HubSpotClient, RateLimited
 from crm.sync import (
     SEARCH_RESULT_CAP,
-    archive_eligible,
+    SYNC_LOCK,
     backfill,
     backfill_state,
+    blocked_types,
     estimate_backfill,
-    reconcile,
-    sync_archived,
+    never_backfilled,
     sync_incremental,
+    weekly_pass,
 )
 from crm.timer import SyncTimer
 
 log = logging.getLogger("watchdog")
 DEFAULTS = Path(__file__).parent / "defaults"
 HOST = "127.0.0.1"          # create_app has no auth: never bind anything wider
-PLACEHOLDER = "REPLACE-ME"
 
 
 class CliError(Exception):
@@ -61,11 +62,6 @@ def _load(home: Path) -> Config:
         signal_settings(config_path)       # validates timezone and week start
     except (ValueError, OSError) as exc:   # TOMLDecodeError is a ValueError
         raise CliError(f"{config_path}: {exc}") from exc
-    if PLACEHOLDER in cfg.hubspot_token:
-        raise CliError(f"{config_path}: [hubspot] token is still the "
-                       "placeholder. Paste your private app's access token.")
-    if cfg.sync_interval_minutes < 1:
-        raise CliError(f"{config_path}: [sync] interval_minutes must be >= 1")
     if not cfg.db_path.is_absolute():
         cfg = dataclasses.replace(cfg, db_path=home / cfg.db_path)
     return cfg
@@ -78,18 +74,16 @@ def _open(cfg: Config) -> sqlite3.Connection:
     return conn
 
 
-def _never_backfilled(conn: sqlite3.Connection) -> list[str]:
-    return [t for t, (phase, _) in backfill_state(conn).items() if phase is None]
-
-
-def _blocked(conn: sqlite3.Connection) -> list[tuple[str, str]]:
-    return [(t, status or "blocked") for t, (phase, status)
-            in backfill_state(conn).items() if phase == "blocked"]
+# httpx words a status error "Client error '401 Unauthorized' for url ...".
+# Matching that shape, not a bare "401", keeps record ids and counts out.
+_REJECTED = re.compile(r"'(401|403)\b")
 
 
 def _say_blocked(blocked: list[tuple[str, str]]) -> None:
     for api_type, message in blocked:
         print(f"BLOCKED {api_type}: {message}", file=sys.stderr)
+    if any(_REJECTED.search(m) for _, m in blocked):
+        print(_TOKEN_HINT, file=sys.stderr)
     print("A blocked type keeps its checkpoint and fails the same way on every "
           "re-run until the cause is fixed (see README: Blocked types need attention).",
           file=sys.stderr)
@@ -98,7 +92,7 @@ def _say_blocked(blocked: list[tuple[str, str]]) -> None:
 def _say_errors(errors: list[str]) -> None:
     for error in errors:
         print(f"error: {error}", file=sys.stderr)
-    if any("401" in e or "403" in e for e in errors):
+    if any(_REJECTED.search(e) for e in errors):
         print(_TOKEN_HINT, file=sys.stderr)
 
 
@@ -170,20 +164,20 @@ def cmd_backfill(args, home: Path) -> int:
 
     try:
         print("Backfilling. Safe to interrupt (Ctrl-C); re-run to resume.")
-        report = backfill(conn, make_client(cfg), progress)
-    except KeyboardInterrupt:
-        print("\nInterrupted. Progress is saved; run `watchdog backfill` again "
-              "to resume where it stopped.", file=sys.stderr)
-        return 130
-    except RateLimited as exc:
-        print(f"HubSpot is rate limiting or unreachable: {exc}\nProgress is "
-              "saved; wait, then re-run `watchdog backfill` to resume.",
-              file=sys.stderr)
-        return 1
-    try:
+        try:
+            report = backfill(conn, make_client(cfg), progress)
+        except KeyboardInterrupt:
+            print("\nInterrupted. Progress is saved; run `watchdog backfill` "
+                  "again to resume where it stopped.", file=sys.stderr)
+            return 130
+        except RateLimited as exc:
+            print(f"HubSpot is rate limiting or unreachable: {exc}\nProgress "
+                  "is saved; wait, then re-run `watchdog backfill` to resume.",
+                  file=sys.stderr)
+            return 1
         for object_type, count in report.per_type.items():
             print(f"{object_type}: {count:,} records this run")
-        blocked = _blocked(conn)
+        blocked = blocked_types(conn)
         states = backfill_state(conn)
         incomplete = [t for t, (phase, _) in states.items() if phase != "complete"]
         _say_errors(report.errors)
@@ -205,15 +199,19 @@ def cmd_backfill(args, home: Path) -> int:
 
 def scheduled_sync(cfg: Config) -> None:
     """One timer-driven incremental sync. Failures propagate to SyncTimer,
-    which logs them and re-arms."""
+    which logs them and re-arms. Shares SYNC_LOCK with the dashboard's Sync
+    now button, so the two never run at once."""
+    if not SYNC_LOCK.acquire(blocking=False):
+        log.info("skipping scheduled sync: another sync is running")
+        return
     conn = _open(cfg)
     try:
-        missing = _never_backfilled(conn)
+        missing = never_backfilled(conn)
         if missing:
             log.warning("skipping sync: never backfilled (%s); run `watchdog "
                         "backfill`", ", ".join(missing))
             return
-        for api_type, message in _blocked(conn):
+        for api_type, message in blocked_types(conn):
             log.warning("%s is blocked: %s", api_type, message)
         report = sync_incremental(conn, make_client(cfg))
         for error in report.errors:
@@ -221,13 +219,14 @@ def scheduled_sync(cfg: Config) -> None:
         log.info("sync finished: %s", report.per_type)
     finally:
         conn.close()
+        SYNC_LOCK.release()
 
 
 def cmd_sync(args, home: Path) -> int:
     cfg = _load(home)
     conn = _open(cfg)
     try:
-        missing = _never_backfilled(conn)
+        missing = never_backfilled(conn)
         if missing:
             print("Not backfilled yet: " + ", ".join(missing) + ".\nRun "
                   "`watchdog estimate`, then `watchdog backfill`; an "
@@ -236,7 +235,7 @@ def cmd_sync(args, home: Path) -> int:
         report = sync_incremental(conn, make_client(cfg))
         for object_type, count in report.per_type.items():
             print(f"{object_type}: {count:,} records changed")
-        blocked = _blocked(conn)
+        blocked = blocked_types(conn)
         _say_errors(report.errors)
         if blocked:
             _say_blocked(blocked)
@@ -253,12 +252,10 @@ def cmd_reconcile(args, home: Path) -> int:
     cfg = _load(home)
     conn = _open(cfg)
     try:
-        client = make_client(cfg)
-        eligible = archive_eligible(conn)
-        errors: list[str] = []
-        if eligible:   # an empty list would make sync_archived do every type
-            errors = sync_archived(conn, client, eligible).errors
-        result = reconcile(conn, client)
+        weekly = weekly_pass(conn, make_client(cfg))
+        errors, result = weekly.errors, weekly.reconciled
+        for object_type, count in weekly.archived_found.items():
+            print(f"{object_type}: archived listing held {count:,} records")
         for object_type, count in result.items():       # not dict(result):
             print(f"{object_type}: {count:,} newly archived")  # keeps .skipped
         for object_type, reason in result.skipped.items():
@@ -282,8 +279,8 @@ def cmd_serve(args, home: Path) -> int:
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     conn = _open(cfg)
     try:
-        missing = _never_backfilled(conn)
-        blocked = _blocked(conn)
+        missing = never_backfilled(conn)
+        blocked = blocked_types(conn)
     finally:
         conn.close()
     if missing:
@@ -294,7 +291,7 @@ def cmd_serve(args, home: Path) -> int:
         _say_blocked(blocked)
     timer = SyncTimer(cfg.sync_interval_minutes * 60,
                       lambda: scheduled_sync(cfg))
-    timer.start()
+    timer.start(immediate=True)   # don't leave the dashboard stale for an interval
     print(f"Dashboard at http://{HOST}:{args.port}  (syncing every "
           f"{cfg.sync_interval_minutes} min; Ctrl-C to stop)")
     try:
@@ -346,18 +343,21 @@ def main(argv: list[str] | None = None) -> int:
         print(f"watchdog: {exc}", file=sys.stderr)
         return 2
     except httpx.HTTPStatusError as exc:
-        code = exc.response.status_code
-        print(f"watchdog: HubSpot answered HTTP {code}. "
+        code, url = exc.response.status_code, exc.request.url
+        print(f"watchdog: HubSpot answered HTTP {code} {exc.response.reason_phrase} "
+              f"for {url}. "
               + (_TOKEN_HINT if code in (401, 403) else
-                 "Check the request in the message above and your HubSpot "
-                 "account."), file=sys.stderr)
+                 "The request was refused; see HubSpot's status page if this "
+                 "is a 5xx, otherwise check the account's scopes."),
+              file=sys.stderr)
         return 1
     except (RateLimited, httpx.TransportError) as exc:
         print(f"watchdog: could not reach HubSpot: {exc}", file=sys.stderr)
         return 1
     except sqlite3.OperationalError as exc:
-        print(f"watchdog: database error: {exc} (is another watchdog "
-              "process using it?)", file=sys.stderr)
+        hint = (" Another watchdog process (serve, sync) holds the database; "
+                "retry in a minute." if "locked" in str(exc).lower() else "")
+        print(f"watchdog: database error: {exc}.{hint}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print("\nInterrupted.", file=sys.stderr)

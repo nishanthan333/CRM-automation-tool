@@ -21,7 +21,7 @@ nothing to totals, and a NULL owner rolls up under "Unassigned".
 
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta, tzinfo
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
 import sqlite3
 
 __all__ = [
@@ -88,8 +88,9 @@ WHERE d.archived = 0 AND s.is_closed = 0
 """,
         explanation=(
             "An open deal (its stage is not marked closed in HubSpot) whose last "
-            "activity, or its creation date if it has never had any, is more "
-            "than {stalled_days} days ago. Ranked by deal value."),
+            "activity is more than {stalled_days} days ago. A deal that has never "
+            "had activity is dated from its creation; with neither recorded it "
+            "is treated as infinitely stale. Ranked by deal value."),
     ),
     Signal(
         id="past_close_date",
@@ -100,11 +101,14 @@ WHERE d.archived = 0 AND s.is_closed = 0
 SELECT d.id, d.hubspot_owner_id, d.amount_in_home_currency
 FROM deals d {_OPEN_DEAL}
 WHERE d.archived = 0 AND s.is_closed = 0
-  AND d.closedate IS NOT NULL AND d.closedate < :today_start_ms
+  AND d.closedate IS NOT NULL AND d.closedate < :today_date_ms
 """,
         explanation=(
-            "An open deal whose close date is before the start of today in this "
-            "machine's local timezone. A deal with no close date is not flagged."),
+            "An open deal whose close date is an earlier calendar day than today "
+            "in this machine's local timezone. HubSpot stores a close date as "
+            "midnight UTC, so dates are compared as days, not instants: a deal "
+            "closing today is not overdue in any timezone. A deal with no close "
+            "date is not flagged."),
     ),
     Signal(
         id="big_and_quiet",
@@ -121,7 +125,9 @@ WHERE d.archived = 0 AND s.is_closed = 0
 """,
         explanation=(
             "An open deal worth more than {big_deal_value:,} (amount in home "
-            "currency) with no activity in {big_deal_quiet_days} days. Overlaps "
+            "currency) with no activity in {big_deal_quiet_days} days (a deal "
+            "never touched is dated from its creation; with neither recorded "
+            "it counts as quiet). Overlaps "
             "stalled deals on purpose: a big deal silent for a week is louder "
             "than a small one silent for a month. A deal with no amount is "
             "never counted as big."),
@@ -160,11 +166,16 @@ UNION ALL
 SELECT c.id, c.hubspot_owner_id, NULL, 'companies'
 FROM companies c
 WHERE c.archived = 0 AND COALESCE(c.hubspot_owner_id, '') = ''
+  AND EXISTS (
+    SELECT 1 FROM associations a
+    JOIN deals d ON d.id = a.from_id AND d.archived = 0
+    JOIN stages s ON s.id = d.dealstage AND s.is_closed = 0
+    WHERE a.to_type = 'companies' AND a.to_id = c.id AND a.from_type = 'deals')
 """,
         explanation=(
-            "An open deal, or any company, with no owner assigned in HubSpot. "
-            "(Unowned records are never hidden in a residual bucket: they are "
-            "flagged here.)"),
+            "An open deal, or a company that has an open deal, with no owner "
+            "assigned in HubSpot. Unowned records with nothing open are not "
+            "flagged (that is CRM hygiene, not a morning action)."),
     ),
     Signal(
         id="stage_regression",
@@ -222,6 +233,8 @@ WHERE prior_avg > 0
 ]
 
 _ENABLED = [s for s in SIGNALS if s.enabled]
+# Fail at import, not inside briefing(), on a mistyped severity.
+assert all(s.severity in SEVERITY_RANK for s in SIGNALS), "unknown severity"
 
 
 def explain(signal: Signal, thresholds: dict) -> str:
@@ -250,7 +263,9 @@ def _context(now_ms: int, tz: tzinfo | None, week_starts_on: str) -> dict:
     elapsed = max(now_ms - week_start_ms, 0)
     ctx = {
         "now_ms": now_ms,
-        "today_start_ms": _midnight_ms(today, tz),
+        # HubSpot dates are midnight UTC of the chosen day, so "today" is the
+        # local calendar date rendered the same way, not local midnight.
+        "today_date_ms": _midnight_ms(today, timezone.utc),
         "week_start_ms": week_start_ms,
         "week_label": week_start.isoformat(),
     }
@@ -262,25 +277,32 @@ def _context(now_ms: int, tz: tzinfo | None, week_starts_on: str) -> dict:
 
 
 def evaluate_all(conn: sqlite3.Connection, thresholds: dict, now_ms: int,
-                 tz: tzinfo | None = None, week_starts_on: str = "monday") -> int:
+                 tz: tzinfo | None = None, week_starts_on: str = "monday",
+                 skip: frozenset[str] = frozenset()) -> int:
     """Run every enabled signal and replace `signal_results` with the hits.
 
     `tz=None` means the machine's local timezone. All queries run before any
     write, and the delete and reinserts share one transaction, so a failing
     signal (a missing threshold, bad SQL) leaves the previous results intact.
+    Signals named in `skip` are not run and their previous results are kept
+    (used when the data they depend on is known to be incomplete).
     Returns the number of rows written.
     """
     context = _context(now_ms, tz, week_starts_on)
     values = thresholds["thresholds"]
     rows = []
     for sig in _ENABLED:
+        if sig.id in skip:
+            continue
         params = {**context, **{name: values[name] for name in sig.thresholds}}
         for r in conn.execute(sig.sql, params).fetchall():
             rows.append((
                 sig.id, str(r[0]), r[3] if len(r) > 3 else sig.record_type,
                 r[1] or None, r[2], now_ms))
     with conn:
-        conn.execute("DELETE FROM signal_results")
+        marks = ", ".join("?" for _ in skip)
+        conn.execute(f"DELETE FROM signal_results WHERE signal_id NOT IN ({marks})",
+                     sorted(skip))
         conn.executemany(
             "INSERT INTO signal_results (signal_id, record_id, record_type,"
             " owner_id, value, computed_at) VALUES (?, ?, ?, ?, ?, ?)", rows)
@@ -300,7 +322,8 @@ def flagged_records(conn: sqlite3.Connection, now_ms: int | None = None,
     ids = [s.id for s in _ENABLED if signal_id in (None, s.id)]
     marks = ", ".join("?" for _ in ids)
     snooze = ("LEFT JOIN snoozes z ON z.signal_id = r.signal_id"
-              " AND z.record_id = r.record_id AND z.until > ?") if now_ms is not None else ""
+              " AND z.record_type = r.record_type AND z.record_id = r.record_id"
+              " AND z.until > ?") if now_ms is not None else ""
     visible = "AND z.signal_id IS NULL" if now_ms is not None else ""
     sql = f"""
 SELECT r.signal_id, r.record_id, r.record_type, r.owner_id, r.value,

@@ -6,7 +6,8 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from crm.signals import (
-    SIGNALS, OwnerRollup, briefing, evaluate_all, explain, total_at_risk,
+    SIGNALS, OwnerRollup, briefing, evaluate_all, explain, flagged_records,
+    total_at_risk,
 )
 from tests.conftest import (
     DAY, DEFAULT_THRESHOLDS, NOW, UTC, add_company, add_deal, add_owner,
@@ -78,6 +79,12 @@ def test_explanation_states_the_rule_with_the_live_threshold():
     assert "21 days" in text and "{" not in text
 
 
+def test_explanations_disclose_the_creation_date_fallback():
+    for sid in ("stalled_deal", "big_and_quiet"):
+        sig = next(s for s in SIGNALS if s.id == sid)
+        assert "creation" in sig.explanation, sid
+
+
 def test_stage_regression_does_not_run(conn):
     add_deal(conn, "d1")
     assert flagged(conn, "stage_regression") == set()
@@ -132,17 +139,32 @@ def test_archived_records_never_flagged(conn):
 
 # --- past_close_date -----------------------------------------------------------------
 
-def test_past_close_date_uses_local_timezone_boundary(conn):
-    # 2026-11-19 01:30 in Kolkata (UTC+5:30); local "today" began 18:30 UTC on the 18th.
+def past_close(conn, now, tz):
+    evaluate(conn, now, tz=tz)
+    return {r[0] for r in conn.execute(
+        "SELECT record_id FROM signal_results WHERE signal_id = 'past_close_date'")}
+
+
+def test_past_close_date_east_of_utc_counts_local_calendar_days(conn):
+    # 2026-11-19 01:30 in Kolkata: already the 19th locally, still the 18th in
+    # UTC. HubSpot stores close dates as midnight UTC.
     kolkata = ZoneInfo("Asia/Kolkata")
     now = ms(2026, 11, 19, 1, 30, tz=kolkata)
-    add_deal(conn, "d_yesterday_local", closedate=ms(2026, 11, 18, 10, 0))  # 15:30 IST, 18th
-    add_deal(conn, "d_today_local", closedate=ms(2026, 11, 18, 19, 0))      # 00:30 IST, 19th
+    add_deal(conn, "d_18th", closedate=ms(2026, 11, 18))
+    add_deal(conn, "d_19th", closedate=ms(2026, 11, 19))
     add_deal(conn, "d_future", closedate=ms(2026, 11, 25))
-    evaluate(conn, now, tz=kolkata)
-    got = {r[0] for r in conn.execute(
-        "SELECT record_id FROM signal_results WHERE signal_id = 'past_close_date'")}
-    assert got == {"d_yesterday_local"}
+    assert past_close(conn, now, kolkata) == {"d_18th"}
+
+
+def test_deal_closing_today_is_not_past_due_west_of_utc(conn):
+    # 09:00 on the 18th in Los Angeles is 17:00 UTC. Local midnight (08:00 UTC)
+    # is after the deal's stored midnight-UTC close date, so comparing instants
+    # would wrongly call a deal closing today overdue.
+    la = ZoneInfo("America/Los_Angeles")
+    now = ms(2026, 11, 18, 9, 0, tz=la)
+    add_deal(conn, "d_today", closedate=ms(2026, 11, 18))
+    add_deal(conn, "d_yesterday", closedate=ms(2026, 11, 17))
+    assert past_close(conn, now, la) == {"d_yesterday"}
 
 
 def test_null_closedate_deal_is_not_flagged_as_past_close(conn):
@@ -186,8 +208,11 @@ def test_unowned_record_flags_null_owner(conn):
     add_deal(conn, "d_blank", owner="")
     add_deal(conn, "d_owned", owner="o1")
     add_deal(conn, "d_closed_unowned", stage="s_won", owner=None)
-    add_company(conn, "c_unowned", owner=None)
-    add_company(conn, "c_owned", owner="o1")
+    add_company(conn, "c_unowned", owner=None, open_deals=["d_owned"])
+    add_company(conn, "c_owned", owner="o1", open_deals=["d_owned"])
+    add_company(conn, "c_unowned_no_deal", owner=None)
+    add_company(conn, "c_unowned_closed_deal", owner=None,
+                open_deals=["d_closed_unowned"])
     assert flagged(conn, "unowned_record") == {"d_unowned", "d_blank", "c_unowned"}
 
 
@@ -318,10 +343,11 @@ def test_briefing_reads_only_signal_results(conn):
     assert [s.signal_id for s in briefing(conn, NOW)] == ["stalled_deal"]
 
 
-def snooze(conn, signal_id, record_id, until):
+def snooze(conn, signal_id, record_id, until, record_type="deals"):
     with conn:
-        conn.execute("INSERT INTO snoozes (signal_id, record_id, until, created_at)"
-                     " VALUES (?, ?, ?, ?)", (signal_id, record_id, until, NOW))
+        conn.execute("INSERT INTO snoozes (signal_id, record_type, record_id,"
+                     " until, created_at) VALUES (?, ?, ?, ?, ?)",
+                     (signal_id, record_type, record_id, until, NOW))
 
 
 def test_unexpired_snooze_hides_a_record_and_expired_one_does_not(conn):
@@ -341,6 +367,23 @@ def test_snooze_is_per_signal(conn):
     snooze(conn, "stalled_deal", "d1", NOW + DAY)
     assert flagged_in_briefing(conn, NOW, "stalled_deal") == set()
     assert flagged_in_briefing(conn, NOW, "big_and_quiet") == {"d1"}
+
+
+def test_snooze_on_a_company_does_not_hide_a_deal_sharing_its_id(conn):
+    # HubSpot object ids are separate sequences, so a deal and a company can
+    # both be "777"; unowned_record flags both.
+    add_deal(conn, "777", amount=4000, owner=None)
+    add_company(conn, "777", owner=None, open_deals=["777"])
+    evaluate(conn)
+    types = {r[0] for r in conn.execute(
+        "SELECT record_type FROM signal_results WHERE record_id = '777'"
+        " AND signal_id = 'unowned_record'")}
+    assert types == {"deals", "companies"}
+    snooze(conn, "unowned_record", "777", NOW + DAY, record_type="companies")
+    rows = [(r["record_type"], r["record_id"])
+            for r in flagged_records(conn, NOW, "unowned_record")]
+    assert ("deals", "777") in rows and ("companies", "777") not in rows
+    assert total_at_risk(conn, NOW) == 4000.0
 
 
 # --- total_at_risk -----------------------------------------------------------------------
@@ -427,3 +470,96 @@ def test_backfill_evaluates_signals(conn, fake_client):
     assert conn.execute(
         "select count(*) from signal_results where record_id = 'd_stale'"
     ).fetchone()[0] > 0
+    row = conn.execute("SELECT phase FROM sync_state"
+                       " WHERE object_type = 'signals'").fetchone()
+    assert row["phase"] == "complete"
+
+
+# --- skipping quiet_pipeline on incomplete data -----------------------------------------
+
+def test_skipped_signal_keeps_its_previous_result_while_others_refresh(conn):
+    for k in range(1, 5):
+        seed_created(conn, f"w{k}_", tuesday_of(k), 10)
+    add_deal(conn, "d_stale", activity=days_ago(20))
+    assert flagged(conn, "quiet_pipeline") == {"2026-11-16"}
+    add_deal(conn, "d_stale", activity=days_ago(1))
+    evaluate(conn, skip=frozenset({"quiet_pipeline"}))
+    kept = {r[0] for r in conn.execute("SELECT signal_id FROM signal_results")}
+    assert kept == {"quiet_pipeline"}   # stalled refreshed away, quiet kept
+
+
+def test_incremental_sync_skips_quiet_pipeline_and_records_partial_state(
+        conn, fake_client):
+    from crm.sync import sync_incremental
+    with conn:
+        conn.execute("INSERT INTO sync_state (object_type, phase) VALUES"
+                     " ('companies', 'backfill')")
+    sync_incremental(conn, fake_client, ["deals"])
+    row = conn.execute("SELECT phase, status FROM sync_state"
+                       " WHERE object_type = 'signals'").fetchone()
+    assert row["phase"] == "partial" and "incomplete" in row["status"]
+
+
+def test_blocked_backfill_run_keeps_the_previous_quiet_pipeline(conn, fake_client):
+    from crm.sync import backfill
+    for k in range(1, 5):
+        seed_created(conn, f"w{k}_", tuesday_of(k), 10)
+    evaluate(conn)       # a flagged quiet_pipeline from earlier, healthy data
+    with conn:
+        conn.execute("DELETE FROM deals")   # now the table looks like a collapse
+    fake_client.list_page = _always_400(fake_client.list_page)
+    report = backfill(conn, fake_client)
+    assert report.errors
+    assert conn.execute("SELECT count(*) FROM signal_results WHERE signal_id"
+                        " = 'quiet_pipeline'").fetchone()[0] == 1
+
+
+def _always_400(original):
+    import httpx
+
+    def fail(object_type, *args, **kwargs):
+        if object_type == "deals":
+            request = httpx.Request("GET", "https://api.hubapi.com/x")
+            raise httpx.HTTPStatusError(
+                "HTTP 400", request=request,
+                response=httpx.Response(400, request=request))
+        return original(object_type, *args, **kwargs)
+    return fail
+
+
+def test_incremental_sync_does_not_evaluate_when_every_type_was_skipped(
+        conn, fake_client):
+    from crm.sync import sync_incremental
+    with conn:
+        conn.execute("INSERT INTO sync_state (object_type, phase) VALUES"
+                     " ('deals', 'backfill')")
+    sync_incremental(conn, fake_client, ["deals"])
+    assert conn.execute("SELECT count(*) FROM sync_state WHERE object_type ="
+                        " 'signals'").fetchone()[0] == 0
+
+
+def test_sync_reads_timezone_and_week_start_from_config(
+        conn, tmp_path, monkeypatch):
+    from crm import sync
+    (tmp_path / "signals.toml").write_text(
+        "[thresholds]\nstalled_days = 14\nbig_deal_quiet_days = 7\n"
+        "big_deal_value = 50000\nuntouched_account_days = 30\n"
+        "quiet_pipeline_drop_pct = 40\n")
+    (tmp_path / "config.toml").write_text(
+        '[local]\ntimezone = "America/Los_Angeles"\nweek_starts_on = "sunday"\n')
+    monkeypatch.setenv("WATCHDOG_HOME", str(tmp_path))
+    seen = {}
+    monkeypatch.setattr(sync, "evaluate_all",
+                        lambda c, t, now, **kw: seen.update(kw))
+    sync._evaluate_signals(conn, complete=True)
+    assert str(seen["tz"]) == "America/Los_Angeles"
+    assert seen["week_starts_on"] == "sunday"
+
+
+def test_invalid_week_start_in_config_is_rejected(tmp_path):
+    from crm.config import signal_settings
+    path = tmp_path / "config.toml"
+    path.write_text('[local]\nweek_starts_on = "funday"\n')
+    with pytest.raises(ValueError, match="week_starts_on"):
+        signal_settings(path)
+    assert signal_settings(tmp_path / "missing.toml") == (None, "monday")

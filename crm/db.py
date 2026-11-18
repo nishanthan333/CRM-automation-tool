@@ -51,9 +51,9 @@ CREATE TABLE IF NOT EXISTS signal_results (
     value REAL, computed_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS snoozes (
-    signal_id TEXT NOT NULL, record_id TEXT NOT NULL,
+    signal_id TEXT NOT NULL, record_type TEXT NOT NULL, record_id TEXT NOT NULL,
     until INTEGER, created_at INTEGER, fingerprint TEXT,
-    PRIMARY KEY (signal_id, record_id)
+    PRIMARY KEY (signal_id, record_type, record_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_deals_owner ON deals(hubspot_owner_id);
@@ -61,6 +61,7 @@ CREATE INDEX IF NOT EXISTS idx_deals_activity ON deals(hs_last_activity_date);
 CREATE INDEX IF NOT EXISTS idx_deals_stage ON deals(dealstage);
 CREATE INDEX IF NOT EXISTS idx_deals_closedate ON deals(closedate);
 CREATE INDEX IF NOT EXISTS idx_deals_archived ON deals(archived);
+CREATE INDEX IF NOT EXISTS idx_deals_createdate ON deals(createdate);
 CREATE INDEX IF NOT EXISTS idx_deals_amount ON deals(amount_in_home_currency);
 CREATE INDEX IF NOT EXISTS idx_companies_owner ON companies(hubspot_owner_id);
 CREATE INDEX IF NOT EXISTS idx_companies_activity ON companies(hs_last_activity_date);
@@ -70,6 +71,7 @@ CREATE INDEX IF NOT EXISTS idx_contacts_activity ON contacts(hs_last_activity_da
 CREATE INDEX IF NOT EXISTS idx_contacts_archived ON contacts(archived);
 CREATE INDEX IF NOT EXISTS idx_assoc_to ON associations(to_type, to_id);
 CREATE INDEX IF NOT EXISTS idx_signal_results_owner ON signal_results(owner_id);
+CREATE INDEX IF NOT EXISTS idx_signal_results_signal ON signal_results(signal_id);
 """
 
 

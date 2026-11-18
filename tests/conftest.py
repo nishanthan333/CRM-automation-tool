@@ -102,7 +102,10 @@ def flagged(conn, signal_id, thresholds=None, now_ms=NOW) -> set[str]:
 
 
 def flagged_in_briefing(conn, now_ms=NOW, signal=None, thresholds=None) -> set[str]:
-    """Record ids the briefing would show, i.e. after snoozes are applied."""
+    """Record ids the briefing would show, i.e. after snoozes are applied.
+
+    Re-runs evaluate_all first (idempotent), so it is not a pure read.
+    """
     from crm.signals import flagged_records
     _evaluated(conn, thresholds, now_ms)
     return {r["record_id"] for r in flagged_records(conn, now_ms, signal)}
@@ -111,6 +114,7 @@ def flagged_in_briefing(conn, now_ms=NOW, signal=None, thresholds=None) -> set[s
 def summary(conn, signal_id, now_ms=NOW, thresholds=None):
     """The briefing's SignalSummary for one signal, plus `.record_ids`.
 
+    Re-runs evaluate_all first, like flagged_in_briefing.
     SignalSummary has no record_ids field; this view adds it, read from
     signal_results through the same snooze filter the briefing uses.
     """

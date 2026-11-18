@@ -18,12 +18,11 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Callable
 
 import httpx
 
-from crm.config import load_thresholds
+from crm.config import home_dir, load_thresholds, signal_settings
 from crm.db import upsert, upsert_sql
 from crm.hubspot import (
     ENGAGEMENT_TYPES,
@@ -155,11 +154,26 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-THRESHOLDS_PATH = Path(__file__).resolve().parent.parent / "signals.toml"
+def _evaluate_signals(conn: sqlite3.Connection, complete: bool) -> None:
+    """Re-materialise the briefing, honouring config.toml's timezone and week.
 
-
-def _evaluate_signals(conn: sqlite3.Connection) -> None:
-    evaluate_all(conn, load_thresholds(THRESHOLDS_PATH), _now_ms())
+    `complete` is False while the data is known to be partial (a backfill is
+    unfinished, or a type errored). `quiet_pipeline` is a ratio over creation
+    dates and would report a fabricated collapse, so it is skipped and its
+    previous result left standing. The state is recorded under
+    sync_state['signals'] (status 'partial: ...') for the dashboard to show.
+    """
+    home = home_dir()
+    tz, week = signal_settings(home / "config.toml")
+    skip = frozenset() if complete else frozenset({"quiet_pipeline"})
+    evaluate_all(conn, load_thresholds(home / "signals.toml"), _now_ms(),
+                 tz=tz, week_starts_on=week, skip=skip)
+    with conn:
+        conn.execute(*_state_sql("signals", {
+            "last_run_at": _now_ms(),
+            "phase": "complete" if complete else "partial",
+            "status": None if complete else
+                      "data incomplete: quiet_pipeline not re-evaluated"}))
 
 
 def _state_sql(object_type: str, fields: dict) -> tuple[str, list]:
@@ -440,6 +454,7 @@ def sync_incremental(conn: sqlite3.Connection, client,
             raise ValueError(f"{object_type!r} cannot be synced incrementally")
 
     _refresh_reference_data(conn, client, report)
+    synced = False
     for object_type in requested:
         if backfill_pending(conn, object_type):
             # A backfill owns this type's cursor and watermark. A search run
@@ -449,9 +464,14 @@ def sync_incremental(conn: sqlite3.Connection, client,
                 f"{object_type}: backfill not complete; run backfill first")
             report.per_type[object_type] = 0
             continue
+        synced = True
         report.per_type[object_type] = _sync_object_type(
             conn, client, object_type, report)
-    _evaluate_signals(conn)
+    if synced:
+        # Nothing changed if every type was skipped, so a full re-scan would
+        # buy nothing.
+        _evaluate_signals(conn, complete=not report.errors and not any(
+            backfill_pending(conn, o) for o in BACKFILL_ORDER))
     return report
 
 
@@ -702,7 +722,8 @@ def backfill(conn: sqlite3.Connection, client,
                 report.errors.append(f"{api_type}: {exc}")
                 break
         report.per_type[object_type] = count
-    _evaluate_signals(conn)
+    _evaluate_signals(conn, complete=not report.errors and all(
+        _is_complete(conn, t) for o in BACKFILL_ORDER for t in api_types(o)))
     return report
 
 

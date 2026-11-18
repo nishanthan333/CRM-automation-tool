@@ -460,3 +460,30 @@ def test_engagement_failure_reason_distinguishes_a_bad_token(client, fake_client
         body = client.get("/record/deals/d1").text
     assert "rejected the token" in body
     assert "HTTPStatusError" in caplog.text        # not swallowed silently
+
+
+# --- how fresh the archive check is ------------------------------------------
+
+def mark_weekly(conn, at_ms):
+    from crm.sync import WEEKLY_STATE, _state_sql
+    with conn:
+        conn.execute(*_state_sql(WEEKLY_STATE, {"last_run_at": at_ms,
+                                                "status": "ok"}))
+
+
+def test_header_says_how_long_ago_archives_were_checked(seeded, fake_client):
+    mark_weekly(seeded, NOW - 3 * 86_400_000)
+    body = build(seeded, fake_client).get("/").text
+    assert "archives checked 3 days ago" in body
+    assert "last sync 4m ago" in body       # the weekly row is not a sync
+
+
+def test_header_warns_when_the_archive_check_is_overdue(seeded, fake_client):
+    mark_weekly(seeded, NOW - 12 * 86_400_000)
+    body = build(seeded, fake_client).get("/").text
+    assert "archives checked 12 days ago" in body and "overdue" in body
+
+
+def test_header_says_archives_have_never_been_checked(client):
+    body = client.get("/").text
+    assert "archives never checked" in body and "overdue" in body

@@ -37,6 +37,7 @@ from crm.snooze import drop_stale_snoozes
 
 __all__ = [
     "reconcile", "sync_archived", "SYNC_LOCK", "WeeklyResult", "blocked_types",
+    "WEEKLY_INTERVAL_MS", "WEEKLY_STATE", "weekly_checked_at", "weekly_due",
     "never_backfilled", "weekly_pass", "archive_eligible", "backfill_state",
     "BACKFILL_ORDER", "Estimate", "backfill", "estimate_backfill",
     "ASSOCIATION_PAIRS", "INCREMENTAL_TYPES", "SEARCH_RESULT_CAP",
@@ -668,11 +669,54 @@ class WeeklyResult:
     reconciled: ReconcileResult = field(default_factory=ReconcileResult)
 
 
+# When the weekly pass last ran, kept in `sync_state` under this pseudo-type,
+# matching the existing ['signals'] convention. It is not an object type: the
+# dashboard's "last sync" and every type loop exclude it.
+WEEKLY_STATE = "weekly"
+WEEKLY_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000
+
+
+def weekly_checked_at(conn: sqlite3.Connection) -> int | None:
+    """When the weekly archive/delete pass last completed, or None."""
+    return _state(conn, WEEKLY_STATE, "last_run_at")
+
+
+def weekly_due(conn: sqlite3.Connection, now_ms: int) -> bool:
+    """True if archives have never been checked, or not for a week.
+
+    This module promises a record archived in HubSpot lingers in the briefing
+    "for up to a week"; with nothing scheduling the pass that read "until the
+    operator remembers".
+    """
+    last = weekly_checked_at(conn)
+    return last is None or now_ms - last >= WEEKLY_INTERVAL_MS
+
+
+def _stamp_weekly(conn: sqlite3.Connection, result: WeeklyResult) -> None:
+    """Record that the pass ran, and what it managed.
+
+    Stamped whatever the outcome: leaving it unstamped after a partial pass
+    would have the serve timer repeat this job, which reads every id of every
+    type, at every sync interval. `status` names what was skipped, so "checked
+    today" is never read as "everything was checked".
+    """
+    skipped = sorted(result.reconciled.skipped)
+    detail = "; ".join(filter(None, [
+        f"skipped: {', '.join(skipped)}" if skipped else "",
+        f"{len(result.errors)} error(s)" if result.errors else ""]))
+    with conn:
+        conn.execute(*_state_sql(WEEKLY_STATE, {
+            "last_run_at": _now_ms(), "status": detail or "ok",
+            "phase": "partial" if detail else COMPLETE}))
+
+
 def weekly_pass(conn: sqlite3.Connection, client) -> WeeklyResult:
     """The weekly operation: archived listing, then hard-delete reconcile.
 
     The archived pass runs only for `archive_eligible` types. An empty list is
-    never passed on: `sync_archived` reads it as "every type".
+    never passed on: `sync_archived` reads it as "every type". Completion is
+    stamped so the dashboard can say how stale the archive check is, and the
+    serve timer can run this when it falls due.
     """
     result = WeeklyResult()
     eligible = archive_eligible(conn)
@@ -680,6 +724,7 @@ def weekly_pass(conn: sqlite3.Connection, client) -> WeeklyResult:
         report = sync_archived(conn, client, eligible)
         result.archived_found, result.errors = report.per_type, report.errors
     result.reconciled = reconcile(conn, client)
+    _stamp_weekly(conn, result)
     return result
 
 

@@ -10,6 +10,7 @@
 <header class="top">
   <a class="brand" href="/">HubSpot Watchdog</a>
   <span class="muted">last sync {{ chrome.last_sync }}</span>
+  <span class="muted stale-{{ "yes" if chrome.archives.stale else "no" }}">{{ chrome.archives.text }}{% if chrome.archives.stale %} (overdue: run <code>watchdog reconcile</code>){% endif %}</span>
   <form method="post" action="/sync"><button type="submit">Sync now</button></form>
 </header>
 <main>

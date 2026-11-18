@@ -250,3 +250,35 @@ def test_weekly_pass_with_nothing_complete_skips_the_archived_pass(conn, fake_cl
     result = weekly_pass(conn, fake_client)
     assert fake_client.list_calls == []
     assert result.archived_found == {} and len(result.reconciled.skipped) == 4
+
+
+# --- the weekly pass leaves a mark -------------------------------------------
+
+def weekly_marker(conn):
+    from crm.sync import weekly_checked_at
+    return weekly_checked_at(conn)
+
+
+def test_weekly_pass_stamps_when_archives_were_last_checked(conn, fake_client):
+    from crm.sync import WEEKLY_STATE, weekly_pass
+    assert weekly_marker(conn) is None
+    complete(conn, "companies")
+    weekly_pass(conn, fake_client)
+    assert weekly_marker(conn) is not None
+    row = conn.execute("SELECT status FROM sync_state WHERE object_type = ?",
+                       (WEEKLY_STATE,)).fetchone()
+    assert row["status"]        # says what the pass did, skips included
+
+
+def test_weekly_pass_is_due_when_never_run_or_older_than_a_week(conn, fake_client):
+    from crm.sync import WEEKLY_INTERVAL_MS, weekly_due, weekly_pass
+    assert weekly_due(conn, 1_800_000_000_000) is True       # never run
+    weekly_pass(conn, fake_client)
+    stamped = weekly_marker(conn)
+    assert weekly_due(conn, stamped) is False
+    assert weekly_due(conn, stamped + WEEKLY_INTERVAL_MS + 1) is True
+
+
+def test_the_weekly_marker_is_not_mistaken_for_an_object_type(conn):
+    from crm.sync import INCREMENTAL_TYPES, WEEKLY_STATE
+    assert WEEKLY_STATE not in INCREMENTAL_TYPES

@@ -167,18 +167,30 @@ Things to know:
 watchdog reconcile
 ```
 
-Run this about once a week. The 15-minute sync cannot see records that were
+`serve` runs this pass itself when it falls due (more than seven days since the
+last one), right after a scheduled sync, so a long-running server keeps its own
+promise. Run the command by hand if you do not leave `serve` running, or to
+force a pass now. The 15-minute sync cannot see records that were
 archived or deleted in HubSpot, and the two passes that find them are too
 expensive to run every 15 minutes (the archived listing has no "changed since"
 filter, so it is re-read in full). This command runs both: it marks archived
 records, then finds hard-deleted ones by comparing every id with HubSpot's.
 
 Until it runs, an archived or deleted record can stay in the briefing for up to a
-week. Records leave the briefing at the next sync after it runs.
+week. Records leave the briefing at the next sync after it runs. Every page's
+header says how long ago archives were last checked, and calls it overdue past
+ten days, so a clean briefing can be read for what it is.
+
+The id walk is also read the other way: a record HubSpot lists as live again is
+un-archived locally. Without that, an archive — whether a real one later undone
+in HubSpot, or one this pass got wrong — could never be cleared, because the
+incremental sync only sees records modified since its watermark.
 
 It only touches types whose backfill is complete, and it refuses to archive
 anything on an id walk that looks truncated (a wrong archive would silently drop
-a live deal). Such types are listed as `SKIPPED <type>: <reason>`, which is
+a live deal). "Truncated" is measured against HubSpot's own count *and* the
+number of live rows held locally, whichever is larger, so neither a capped
+search total nor a mass archive in HubSpot can quietly empty the briefing. Such types are listed as `SKIPPED <type>: <reason>`, which is
 different from `0 newly archived`, and the command exits non-zero. A skip means
 the weekly pass did not happen for that type.
 

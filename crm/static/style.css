@@ -15,6 +15,7 @@ h3 { font-size:.95rem; margin:1rem 0 .25rem; }
 .top .brand { font-weight:700; text-decoration:none; color:var(--fg); margin-right:auto; }
 .top form { margin:0; }
 .muted { color:var(--muted); font-size:.9em; }
+.top .stale-yes { color:var(--medium); }
 .totals { font-size:1.1rem; margin:.25rem 0 1rem; }
 button { font:inherit; padding:.3rem .7rem; border:1px solid var(--line); border-radius:6px;
   background:var(--card); color:var(--fg); cursor:pointer; }

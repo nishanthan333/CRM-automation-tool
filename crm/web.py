@@ -36,7 +36,8 @@ from crm.hubspot import ENGAGEMENT_TYPES, HubSpotClient
 from crm.signals import (SIGNALS, UNASSIGNED, briefing, explain, flagged_page,
                          flags_for_record, owner_rollups, total_at_risk)
 from crm.snooze import SNOOZE_FIELDS, snooze
-from crm.sync import SYNC_LOCK, sync_incremental
+from crm.sync import (SYNC_LOCK, WEEKLY_STATE, sync_incremental,
+                      weekly_checked_at)
 
 __all__ = ["LABELS", "PAGE_SIZE", "create_app"]
 
@@ -45,6 +46,8 @@ log = logging.getLogger(__name__)
 PAGE_SIZE = 50
 OWNERS_SHOWN = 5            # owner rows on an index card before "… N more"
 ENGAGEMENTS_SHOWN = 20
+# Past this, the weekly archive/delete pass is overdue (it is due weekly).
+ARCHIVE_CHECK_WARN_DAYS = 10
 NO_OWNER = "_none"          # ?owner= value for the Unassigned bucket
 DAY_MS = 86_400_000
 # HubSpot's object type ids, for the "open in HubSpot" link.
@@ -148,18 +151,36 @@ def _state(conn: sqlite3.Connection, object_type: str) -> sqlite3.Row | None:
                         (object_type,)).fetchone()
 
 
+def _archives(conn: sqlite3.Connection, now_ms: int) -> dict:
+    """How stale the weekly archive/delete check is.
+
+    A reader looking at a clean briefing must be able to tell whether archives
+    were checked yesterday or five weeks ago: acting on flags for records that
+    no longer exist is the failure the design doc calls worse than no tool.
+    """
+    last = weekly_checked_at(conn)
+    if not last:
+        return {"text": "archives never checked", "stale": True}
+    days = max((now_ms - last) // DAY_MS, 0)
+    when = {0: "today", 1: "1 day ago"}.get(days, f"{days} days ago")
+    return {"text": f"archives checked {when}",
+            "stale": days >= ARCHIVE_CHECK_WARN_DAYS}
+
+
 def _chrome(conn: sqlite3.Connection, now_ms: int, notice) -> dict:
-    """What every page's header needs: last sync, data-incomplete marker."""
+    """What every page's header needs: last sync, archive-check age,
+    data-incomplete marker."""
     last = conn.execute(
         "SELECT MAX(last_run_at) AS t FROM sync_state"
-        " WHERE object_type != 'signals'").fetchone()["t"]
+        " WHERE object_type NOT IN ('signals', ?)", (WEEKLY_STATE,)).fetchone()["t"]
     signals = _state(conn, "signals")
     partial = None
     if signals is not None and signals["phase"] == "partial":
         # The banner supplies the "Data incomplete." heading itself.
         partial = re.sub(r"^\s*data incomplete:?\s*", "",
                          signals["status"] or "", flags=re.I) or "Some data is missing"
-    return {"last_sync": ago(last, now_ms), "partial": partial, "notice": notice}
+    return {"last_sync": ago(last, now_ms), "partial": partial,
+            "notice": notice, "archives": _archives(conn, now_ms)}
 
 
 def _thresholds() -> dict | None:

@@ -11,6 +11,7 @@ import os
 import re
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 import httpx
@@ -28,6 +29,7 @@ from crm.sync import (
     estimate_backfill,
     never_backfilled,
     sync_incremental,
+    weekly_due,
     weekly_pass,
 )
 from crm.timer import SyncTimer
@@ -227,6 +229,20 @@ def scheduled_sync(cfg: Config) -> None:
         for error in report.errors:
             log.warning("sync: %s", error)
         log.info("sync finished: %s", report.per_type)
+        # The weekly pass is what makes "archived in HubSpot lingers for up to
+        # a week" true; nothing else schedules it. It pages every id, so it
+        # runs only when due, never per sync. `watchdog reconcile` still forces
+        # one by hand.
+        if weekly_due(conn, int(time.time() * 1000)):
+            log.info("archives were last checked over a week ago; running the "
+                     "weekly archived and deleted-record pass")
+            weekly = weekly_pass(conn, make_client(cfg))
+            for error in weekly.errors:
+                log.warning("weekly pass: %s", error)
+            for object_type, reason in weekly.reconciled.skipped.items():
+                log.warning("weekly pass skipped %s: %s", object_type, reason)
+            log.info("weekly pass finished: archived %s, un-archived %s",
+                     dict(weekly.reconciled), weekly.reconciled.unarchived)
     finally:
         if conn is not None:
             conn.close()

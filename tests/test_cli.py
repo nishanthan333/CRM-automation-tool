@@ -502,3 +502,24 @@ def test_scheduled_job_releases_the_lock_when_opening_the_database_fails(home, c
         cli.scheduled_sync(cfg_for(home))
     assert SYNC_LOCK.acquire(blocking=False)
     SYNC_LOCK.release()
+
+
+# --- the weekly pass on a schedule -------------------------------------------
+
+def test_scheduled_sync_runs_the_weekly_pass_when_it_falls_due(home, client):
+    from crm.sync import weekly_checked_at
+    conn = db(home)
+    complete_all(conn)
+    conn.close()
+    cli.scheduled_sync(cfg_for(home))
+    assert client.ids_only_calls                  # the id walk ran
+    assert any(c.archived for c in client.list_calls)
+    conn = db(home)
+    try:
+        assert weekly_checked_at(conn) is not None
+    finally:
+        conn.close()
+    client.reset_calls()
+    cli.scheduled_sync(cfg_for(home))             # not due again for a week
+    assert client.ids_only_calls == []
+    assert not any(c.archived for c in client.list_calls)

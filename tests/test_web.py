@@ -185,6 +185,25 @@ def test_index_card_also_carries_rule_and_sql(client):
     assert "more than 14 days ago" in body and "archived = 0" in body
 
 
+def test_record_list_carries_the_stage_and_the_date_the_rule_tests(client):
+    """A reader must see why a row is flagged without opening it."""
+    body = client.get("/signal/stalled_deal").text
+    assert "<th>Stage</th>" in body and "<th>Last activity</th>" in body
+    assert "Qualify" in body and "20d ago" in body
+
+
+def test_overdue_list_dates_the_close_date_not_the_activity(client):
+    body = client.get("/signal/past_close_date").text
+    assert "<th>Close date</th>" in body and "<th>Last activity</th>" not in body
+    assert "10d ago" in body       # d1 closed ten days back, not its activity
+
+
+def test_a_company_has_no_stage_and_says_so_with_a_blank(client):
+    body = client.get("/signal/untouched_account").text
+    assert "Acme Corp" in body and "60d ago" in body
+    assert "Qualify" not in body   # the company's own row carries no stage
+
+
 def test_unknown_or_disabled_signal_is_404(client):
     assert client.get("/signal/nope").status_code == 404
     assert client.get("/signal/stage_regression").status_code == 404

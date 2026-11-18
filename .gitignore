@@ -2,3 +2,5 @@
 config.toml
 data/
 __pycache__/
+demo/
+.claude/

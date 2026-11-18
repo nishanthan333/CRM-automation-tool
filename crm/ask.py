@@ -132,7 +132,9 @@ def generate_sql(question: str, schema: str, cfg: Config, http=None) -> str:
             f"Ollama answered {exc.response.status_code} for model "
             f"{cfg.ollama_model!r} (is it pulled?)") from exc
     except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
-        raise ModelUnavailable(f"Ollama is not reachable at {cfg.ollama_url}") from exc
+        raise ModelUnavailable(
+            f"Ollama is not reachable at {cfg.ollama_url} — start it with "
+            "`ollama serve`") from exc
 
 
 _FENCE = re.compile(r"```[a-zA-Z]*\s*\n?(.*?)```", re.S)

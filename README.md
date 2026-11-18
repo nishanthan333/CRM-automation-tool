@@ -18,6 +18,18 @@ pip install -e .          # installs the `watchdog` command
 
 (`python -m crm ...` works too.)
 
+## See it first, without a HubSpot account
+
+```
+python scripts/seed_demo.py          # writes ./demo, a fictional mortgage brokerage
+python scripts/serve_demo.py         # dashboard at http://127.0.0.1:8077
+```
+
+364 loan files across seven officers and two pipelines, shaped so every signal
+fires. Nothing touches the network, and `demo/` is git-ignored — delete it when
+you are done. The thresholds in `demo/signals.toml` are set for loan amounts,
+which is a useful example of the tuning the next section describes.
+
 ## Setup, in order
 
 Do these in order. Skipping ahead is how you end up waiting an hour for nothing.

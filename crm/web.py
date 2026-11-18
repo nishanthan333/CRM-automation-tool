@@ -275,6 +275,34 @@ def _names(conn: sqlite3.Connection, record_type: str,
         f"SELECT id, {column} AS n FROM {record_type} WHERE id IN ({marks})", ids)}
 
 
+# Beside each flagged record, the date its own rule tests, so a reader can see
+# why the row is there without opening it. Everything but an overdue close date
+# is judged on when the record was last touched.
+WHEN_COLUMN = {"past_close_date": "Close date"}
+DEFAULT_WHEN = "Last activity"
+
+# `stage` and `when` per record type; companies and contacts have no stage and
+# no close date, and render blank.
+_DETAIL_SQL = {
+    "deals": "SELECT d.id, s.label AS stage, d.hs_last_activity_date AS activity,"
+             " d.closedate AS closedate FROM deals d"
+             " LEFT JOIN stages s ON s.id = d.dealstage WHERE d.id IN ",
+    "companies": "SELECT id, NULL AS stage, hs_last_activity_date AS activity,"
+                 " NULL AS closedate FROM companies WHERE id IN ",
+    "contacts": "SELECT id, NULL AS stage, hs_last_activity_date AS activity,"
+                " NULL AS closedate FROM contacts WHERE id IN ",
+}
+
+
+def _details(conn: sqlite3.Connection, record_type: str,
+             ids: list[str]) -> dict[str, sqlite3.Row]:
+    sql = _DETAIL_SQL.get(record_type)
+    if not sql or not ids:
+        return {}
+    marks = "(" + ", ".join("?" for _ in ids) + ")"
+    return {r["id"]: r for r in conn.execute(sql + marks, ids)}
+
+
 def _signal_context(conn: sqlite3.Connection, now_ms: int, signal_id: str,
                     owner: str | None, page: int) -> dict:
     sig = SIGNAL_BY_ID[signal_id]
@@ -293,23 +321,31 @@ def _signal_context(conn: sqlite3.Connection, now_ms: int, signal_id: str,
         unassigned=owner == NO_OWNER, limit=PAGE_SIZE,
         offset=(page - 1) * PAGE_SIZE)
     names: dict[str, dict[str, str]] = {}
+    detail: dict[str, dict[str, sqlite3.Row]] = {}
     for record_type in {r["record_type"] for r in shown}:
-        names[record_type] = _names(
-            conn, record_type,
-            [r["record_id"] for r in shown if r["record_type"] == record_type])
-    records = [{
-        "type": r["record_type"], "id": r["record_id"],
-        "name": names.get(r["record_type"], {}).get(r["record_id"]) or r["record_id"],
-        "owner": _owner_label(r, r["owner_id"]), "value": r["value"],
-        "link": r["record_type"] in RECORD_TABLES,
-        "snoozable": r["record_type"] in SNOOZE_FIELDS,
-    } for r in shown]
+        ids = [r["record_id"] for r in shown if r["record_type"] == record_type]
+        names[record_type] = _names(conn, record_type, ids)
+        detail[record_type] = _details(conn, record_type, ids)
+    when_key = "closedate" if signal_id in WHEN_COLUMN else "activity"
+    records = []
+    for r in shown:
+        d = detail.get(r["record_type"], {}).get(r["record_id"])
+        records.append({
+            "type": r["record_type"], "id": r["record_id"],
+            "name": names.get(r["record_type"], {}).get(r["record_id"]) or r["record_id"],
+            "owner": _owner_label(r, r["owner_id"]), "value": r["value"],
+            "stage": (d["stage"] if d else None) or "",
+            "when": ago(d[when_key], now_ms) if d else "",
+            "link": r["record_type"] in RECORD_TABLES,
+            "snoozable": r["record_type"] in SNOOZE_FIELDS,
+        })
     summary = SimpleNamespace(
         count=flagged_total, total_value=sum(o.total_value for o in rollups),
         by_owner=rollups) if rollups else None
     return {
         "signal": _rule(sig, _thresholds()),
         "summary": summary, "owner": owner, "records": records,
+        "when_label": WHEN_COLUMN.get(signal_id, DEFAULT_WHEN),
         "total": total, "page": page, "pages": pages, "page_size": PAGE_SIZE,
         "owner_names": {o.owner_id or NO_OWNER: o.label for o in rollups},
     }

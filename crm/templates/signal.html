@@ -21,12 +21,14 @@
 <h2>Records{% if owner %} · {{ owner_names.get(owner, owner) }}{% endif %}</h2>
 {% if records %}
 <table>
-  <thead><tr><th>Record</th><th>Owner</th><th>Value</th><th></th></tr></thead>
+  <thead><tr><th>Record</th><th>Stage</th><th>Owner</th><th>{{ when_label }}</th><th>Value</th><th></th></tr></thead>
   <tbody>
   {% for r in records %}
   <tr>
     <td>{% if r.link %}<a href="/record/{{ r.type }}/{{ r.id|urlencode }}">{{ r.name }}</a>{% else %}{{ r.name }}{% endif %}</td>
+    <td class="muted">{{ r.stage }}</td>
     <td>{{ r.owner }}</td>
+    <td class="muted">{{ r.when }}</td>
     <td>{% if r.value %}{{ r.value|money }}{% endif %}</td>
     <td>{% if r.snoozable %}
       <form method="post" action="/snooze" class="inline">

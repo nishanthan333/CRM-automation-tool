@@ -38,6 +38,7 @@ from crm.snooze import drop_stale_snoozes
 __all__ = [
     "reconcile", "sync_archived", "SYNC_LOCK", "WeeklyResult", "blocked_types",
     "WEEKLY_INTERVAL_MS", "WEEKLY_STATE", "weekly_checked_at", "weekly_due",
+    "WEEKLY_FAILED", "WEEKLY_NOTHING", "WEEKLY_PARTIAL",
     "never_backfilled", "weekly_pass", "archive_eligible", "backfill_state",
     "BACKFILL_ORDER", "Estimate", "backfill", "estimate_backfill",
     "ASSOCIATION_PAIRS", "INCREMENTAL_TYPES", "SEARCH_RESULT_CAP",
@@ -703,22 +704,42 @@ def weekly_due(conn: sqlite3.Connection, now_ms: int) -> bool:
     return last is None or now_ms - last >= WEEKLY_INTERVAL_MS
 
 
-def _stamp_weekly(conn: sqlite3.Connection, result: WeeklyResult) -> None:
-    """Record that the pass ran, and what it managed.
+# What the marker's `phase` says about the last pass. The dashboard reads it:
+# "ran" is not "checked", so a pass that skipped everything, or died, must not
+# render as a clean check.
+WEEKLY_PARTIAL = "partial"    # some types checked, some skipped or errored
+WEEKLY_NOTHING = "skipped"    # the pass ran and checked no type at all
+WEEKLY_FAILED = "failed"      # the pass raised; what it managed is unknown
 
-    Stamped whatever the outcome: leaving it unstamped after a partial pass
-    would have the serve timer repeat this job, which reads every id of every
-    type, at every sync interval. `status` names what was skipped, so "checked
-    today" is never read as "everything was checked".
+
+def _stamp_weekly(conn: sqlite3.Connection, result: WeeklyResult,
+                  failure: BaseException | None = None) -> None:
+    """Record that the pass ran, what it managed, and whether it survived.
+
+    Stamped whatever the outcome, the exception path included: leaving it
+    unstamped would have the serve timer repeat this job, which reads every id
+    of every type, at every sync interval — and `reconcile` propagates
+    RateLimited by design, so the failure that recurs is exactly the one that
+    means the quota is gone. `phase` and `status` carry enough for the
+    dashboard to tell a clean pass from a partial, an empty or a failed one.
     """
     skipped = sorted(result.reconciled.skipped)
     detail = "; ".join(filter(None, [
+        f"failed: {type(failure).__name__}: {failure}" if failure else "",
         f"skipped: {', '.join(skipped)}" if skipped else "",
         f"{len(result.errors)} error(s)" if result.errors else ""]))
+    if failure is not None:
+        phase = WEEKLY_FAILED
+    elif not result.reconciled:
+        phase = WEEKLY_NOTHING
+    elif detail:
+        phase = WEEKLY_PARTIAL
+    else:
+        phase = COMPLETE
     with conn:
         conn.execute(*_state_sql(WEEKLY_STATE, {
             "last_run_at": _now_ms(), "status": detail or "ok",
-            "phase": "partial" if detail else COMPLETE}))
+            "phase": phase}))
 
 
 def weekly_pass(conn: sqlite3.Connection, client) -> WeeklyResult:
@@ -730,11 +751,18 @@ def weekly_pass(conn: sqlite3.Connection, client) -> WeeklyResult:
     serve timer can run this when it falls due.
     """
     result = WeeklyResult()
-    eligible = archive_eligible(conn)
-    if eligible:
-        report = sync_archived(conn, client, eligible)
-        result.archived_found, result.errors = report.per_type, report.errors
-    result.reconciled = reconcile(conn, client)
+    try:
+        eligible = archive_eligible(conn)
+        if eligible:
+            report = sync_archived(conn, client, eligible)
+            result.archived_found, result.errors = report.per_type, report.errors
+        result.reconciled = reconcile(conn, client)
+    except Exception as exc:   # noqa: BLE001 - re-raised; the marker is the point
+        try:
+            _stamp_weekly(conn, result, failure=exc)
+        except sqlite3.Error:
+            pass               # the failure being reported matters more
+        raise
     _stamp_weekly(conn, result)
     return result
 

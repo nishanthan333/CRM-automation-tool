@@ -282,3 +282,43 @@ def test_weekly_pass_is_due_when_never_run_or_older_than_a_week(conn, fake_clien
 def test_the_weekly_marker_is_not_mistaken_for_an_object_type(conn):
     from crm.sync import INCREMENTAL_TYPES, WEEKLY_STATE
     assert WEEKLY_STATE not in INCREMENTAL_TYPES
+
+
+def test_a_weekly_pass_that_raises_still_leaves_a_marker(conn, fake_client):
+    """reconcile propagates RateLimited by design. Without a marker the serve
+    timer would re-run the most expensive operation in the system at every
+    interval, burning the very quota whose exhaustion caused the failure."""
+    from crm.sync import WEEKLY_FAILED, weekly_due, weekly_pass
+    complete(conn, "companies")
+
+    def boom(object_type, after):
+        raise RateLimited("fake 429")
+
+    fake_client.list_ids_page = boom
+    with pytest.raises(RateLimited):
+        weekly_pass(conn, fake_client)
+    stamped = weekly_marker(conn)
+    assert stamped is not None
+    assert weekly_due(conn, stamped) is False          # not retried next tick
+    row = conn.execute("SELECT phase, status FROM sync_state WHERE"
+                       " object_type = 'weekly'").fetchone()
+    assert row["phase"] == WEEKLY_FAILED
+    assert "RateLimited" in row["status"]
+
+
+def test_a_pass_that_checked_nothing_is_marked_as_such(conn, fake_client):
+    from crm.sync import WEEKLY_NOTHING, WEEKLY_PARTIAL, weekly_pass
+    result = weekly_pass(conn, fake_client)            # nothing is complete
+    assert len(result.reconciled.skipped) == 4
+    phase = conn.execute("SELECT phase FROM sync_state WHERE object_type ="
+                         " 'weekly'").fetchone()["phase"]
+    assert phase == WEEKLY_NOTHING != WEEKLY_PARTIAL
+
+
+def test_a_pass_that_checked_some_types_is_marked_partial(conn, fake_client):
+    from crm.sync import WEEKLY_PARTIAL, weekly_pass
+    complete(conn, "companies")
+    weekly_pass(conn, fake_client)                     # the other three skipped
+    phase = conn.execute("SELECT phase FROM sync_state WHERE object_type ="
+                         " 'weekly'").fetchone()["phase"]
+    assert phase == WEEKLY_PARTIAL

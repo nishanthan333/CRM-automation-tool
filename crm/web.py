@@ -36,8 +36,8 @@ from crm.hubspot import ENGAGEMENT_TYPES, HubSpotClient
 from crm.signals import (SIGNALS, UNASSIGNED, briefing, explain, flagged_page,
                          flags_for_record, owner_rollups, total_at_risk)
 from crm.snooze import SNOOZE_FIELDS, snooze
-from crm.sync import (SYNC_LOCK, WEEKLY_STATE, sync_incremental,
-                      weekly_checked_at)
+from crm.sync import (SYNC_LOCK, WEEKLY_FAILED, WEEKLY_NOTHING,
+                      WEEKLY_PARTIAL, WEEKLY_STATE, sync_incremental)
 
 __all__ = ["LABELS", "PAGE_SIZE", "create_app"]
 
@@ -157,13 +157,26 @@ def _archives(conn: sqlite3.Connection, now_ms: int) -> dict:
     A reader looking at a clean briefing must be able to tell whether archives
     were checked yesterday or five weeks ago: acting on flags for records that
     no longer exist is the failure the design doc calls worse than no tool.
+
+    That the pass *ran* is not that archives were *checked*. A pass that
+    skipped every type (every type can be skipped: `watchdog reconcile` then
+    prints SKIPPED and exits 1) or that died part-way must not render as a
+    clean check, so the marker's phase is read, not just its timestamp.
     """
-    last = weekly_checked_at(conn)
+    row = _state(conn, WEEKLY_STATE)
+    last = row["last_run_at"] if row else None
     if not last:
         return {"text": "archives never checked", "stale": True}
     days = max((now_ms - last) // DAY_MS, 0)
     when = {0: "today", 1: "1 day ago"}.get(days, f"{days} days ago")
-    return {"text": f"archives checked {when}",
+    phase = row["phase"]
+    if phase == WEEKLY_FAILED:
+        return {"text": f"last archive check failed ({when})", "stale": True}
+    if phase == WEEKLY_NOTHING:
+        return {"text": f"archives not checked (last attempt {when})",
+                "stale": True}
+    partly = "partly " if phase == WEEKLY_PARTIAL else ""
+    return {"text": f"archives {partly}checked {when}",
             "stale": days >= ARCHIVE_CHECK_WARN_DAYS}
 
 

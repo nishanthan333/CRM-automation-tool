@@ -464,11 +464,12 @@ def test_engagement_failure_reason_distinguishes_a_bad_token(client, fake_client
 
 # --- how fresh the archive check is ------------------------------------------
 
-def mark_weekly(conn, at_ms):
+def mark_weekly(conn, at_ms, phase="complete"):
     from crm.sync import WEEKLY_STATE, _state_sql
     with conn:
         conn.execute(*_state_sql(WEEKLY_STATE, {"last_run_at": at_ms,
-                                                "status": "ok"}))
+                                                "status": "ok",
+                                                "phase": phase}))
 
 
 def test_header_says_how_long_ago_archives_were_checked(seeded, fake_client):
@@ -487,3 +488,29 @@ def test_header_warns_when_the_archive_check_is_overdue(seeded, fake_client):
 def test_header_says_archives_have_never_been_checked(client):
     body = client.get("/").text
     assert "archives never checked" in body and "overdue" in body
+
+
+def test_header_does_not_claim_a_check_when_every_type_was_skipped(seeded, fake_client):
+    """`watchdog reconcile` can skip every type and exit 1; the header must not
+    then say archives were checked today."""
+    from crm.sync import weekly_pass
+    with seeded:
+        seeded.execute("UPDATE sync_state SET phase = 'backfill'"
+                       " WHERE object_type = 'deals'")
+    weekly_pass(seeded, fake_client)
+    body = build(seeded, fake_client).get("/").text
+    assert "archives checked today" not in body
+    assert "archives not checked" in body and "overdue" in body
+
+
+def test_header_says_partly_checked_when_some_types_were_skipped(seeded, fake_client):
+    mark_weekly(seeded, NOW - 86_400_000, phase="partial")
+    body = build(seeded, fake_client).get("/").text
+    assert "archives partly checked 1 day ago" in body
+
+
+def test_header_says_so_when_the_last_archive_check_failed(seeded, fake_client):
+    mark_weekly(seeded, NOW, phase="failed")
+    body = build(seeded, fake_client).get("/").text
+    assert "archives checked today" not in body
+    assert "last archive check failed" in body and "overdue" in body

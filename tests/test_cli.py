@@ -548,3 +548,19 @@ def test_a_non_numeric_threshold_is_rejected(home, client, capsys):
                            "quiet_pipeline_drop_pct = 40\n")
     assert main(["sync"]) == 2
     assert "stalled_days" in capsys.readouterr().err
+
+
+def test_a_failed_weekly_pass_is_not_retried_at_every_tick(home, client):
+    conn = db(home)
+    complete_all(conn)
+    conn.close()
+
+    def boom(object_type, after):
+        raise RateLimited("fake 429")
+
+    client.list_ids_page = boom
+    with pytest.raises(RateLimited):
+        cli.scheduled_sync(cfg_for(home))
+    client.reset_calls()
+    cli.scheduled_sync(cfg_for(home))
+    assert client.ids_only_calls == []

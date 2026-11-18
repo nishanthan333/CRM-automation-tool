@@ -179,7 +179,13 @@ records, then finds hard-deleted ones by comparing every id with HubSpot's.
 Until it runs, an archived or deleted record can stay in the briefing for up to a
 week. Records leave the briefing at the next sync after it runs. Every page's
 header says how long ago archives were last checked, and calls it overdue past
-ten days, so a clean briefing can be read for what it is.
+ten days, so a clean briefing can be read for what it is. It distinguishes a
+clean pass from one that checked only some types ("archives partly checked"),
+one that checked none, and one that failed part-way — each of the last three is
+flagged overdue whatever its age, because a pass having *run* is not archives
+having been *checked*. A pass that failed (a rate limit, say) is not retried
+before the next weekly slot: the header asks for attention instead, and
+`watchdog reconcile` forces one immediately.
 
 The id walk is also read the other way: a record HubSpot lists as live again is
 un-archived locally. Without that, an archive — whether a real one later undone

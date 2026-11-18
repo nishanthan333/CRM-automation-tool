@@ -7,7 +7,7 @@ timezone = "local"             # bucketing uses this timezone
 week_starts_on = "monday"
 
 [ollama]
-model = "llama3.1"
+model = "qwen2.5-coder:7b"
 url = "http://localhost:11434"
 
 [sync]

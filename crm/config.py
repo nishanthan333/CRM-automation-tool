@@ -30,7 +30,7 @@ def load_config(path: Path) -> Config:
         db_path=Path(local.get("db_path", "data/crm.db")),
         timezone=local.get("timezone", "local"),
         week_starts_on=local.get("week_starts_on", "monday"),
-        ollama_model=ollama.get("model", "llama3.1"),
+        ollama_model=ollama.get("model", "qwen2.5-coder:7b"),
         ollama_url=ollama.get("url", "http://localhost:11434"),
         sync_interval_minutes=int(data.get("sync", {}).get("interval_minutes", 15)),
     )

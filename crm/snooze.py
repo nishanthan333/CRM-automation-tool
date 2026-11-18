@@ -14,6 +14,8 @@ import json
 import sqlite3
 import time
 
+from crm.signals import SIGNALS
+
 # record_type (the local table, as stored in snoozes/signal_results) -> columns
 # whose change is material. A rename or any other field is deliberately absent.
 SNOOZE_FIELDS: dict[str, tuple[str, ...]] = {
@@ -46,6 +48,11 @@ def fingerprint(conn: sqlite3.Connection, record_type: str,
 def snooze(conn: sqlite3.Connection, signal_id: str, record_type: str,
            record_id: str, until_ms: int, now_ms: int | None = None) -> None:
     """Hide one record under one signal until `until_ms` (replaces any prior)."""
+    if record_type not in SNOOZE_FIELDS:
+        raise ValueError(f"cannot snooze record_type {record_type!r}; "
+                         f"expected one of {sorted(SNOOZE_FIELDS)}")
+    if signal_id not in {sig.id for sig in SIGNALS if sig.enabled}:
+        raise ValueError(f"cannot snooze unknown or disabled signal {signal_id!r}")
     created = int(time.time() * 1000) if now_ms is None else now_ms
     record_id = str(record_id)
     with conn:
@@ -67,25 +74,24 @@ def active_snoozes(conn: sqlite3.Connection,
         (now_ms,))}
 
 
-def drop_stale_snoozes(conn: sqlite3.Connection, record_type: str,
-                       changed_ids: list[str]) -> int:
-    """Delete snoozes on `changed_ids` whose material fields have changed.
+def drop_stale_snoozes(conn: sqlite3.Connection) -> int:
+    """Delete every snooze whose record's material fields have since changed.
 
-    Returns how many were dropped. Snoozes with no stored fingerprint cannot be
-    judged and are kept.
+    Checks all snoozed rows, so it does not matter which path (incremental,
+    backfill, reconcile) changed the record. Returns how many were dropped.
+    A snooze with no stored fingerprint cannot be judged and is kept: that is
+    the safe direction (at worst it expires on schedule).
     """
     dropped = 0
     with conn:
-        for record_id in dict.fromkeys(str(i) for i in changed_ids):
-            for signal_id, stored in conn.execute(
-                    "SELECT signal_id, fingerprint FROM snoozes"
-                    " WHERE record_type = ? AND record_id = ?",
-                    (record_type, record_id)).fetchall():
-                if stored is None or stored == fingerprint(
-                        conn, record_type, record_id):
-                    continue
-                conn.execute(
-                    "DELETE FROM snoozes WHERE signal_id = ? AND record_type = ?"
-                    " AND record_id = ?", (signal_id, record_type, record_id))
-                dropped += 1
+        for signal_id, record_type, record_id, stored in conn.execute(
+                "SELECT signal_id, record_type, record_id, fingerprint"
+                " FROM snoozes").fetchall():
+            if stored is None or stored == fingerprint(
+                    conn, record_type, record_id):
+                continue
+            conn.execute(
+                "DELETE FROM snoozes WHERE signal_id = ? AND record_type = ?"
+                " AND record_id = ?", (signal_id, record_type, record_id))
+            dropped += 1
     return dropped

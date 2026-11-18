@@ -166,6 +166,8 @@ def _evaluate_signals(conn: sqlite3.Connection, complete: bool) -> None:
     """
     home = home_dir()
     tz, week = signal_settings(home / "config.toml")
+    # A new amount/stage/owner voids a snooze, whichever path wrote it.
+    drop_stale_snoozes(conn)
     skip = frozenset() if complete else frozenset({"quiet_pipeline"})
     evaluate_all(conn, load_thresholds(home / "signals.toml"), _now_ms(),
                  tz=tz, week_starts_on=week, skip=skip)
@@ -425,8 +427,6 @@ def _sync_object_type(conn: sqlite3.Connection, client, object_type: str,
             count += found
             ids.extend(seen)
             pending.append((api_type, max_modified))
-            # A new amount/stage/owner voids a snooze; runs before evaluation.
-            drop_stale_snoozes(conn, table_for(api_type), seen)
         # Associations land *before* the watermark moves. A record past the
         # watermark is never searched again, so advancing first would strand
         # stale association rows permanently if this refresh failed.

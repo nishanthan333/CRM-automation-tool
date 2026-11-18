@@ -5,7 +5,7 @@ import pytest
 
 from crm.hubspot import ENGAGEMENT_TYPES, RateLimited
 from crm.sync import (
-    BACKFILL_ORDER, Estimate, backfill, cursor, estimate_backfill,
+    BACKFILL_ORDER, Estimate, backfill_pending, backfill, cursor, estimate_backfill,
     sync_incremental, watermark,
 )
 from tests.fakes import FakePage
@@ -211,7 +211,7 @@ def test_http_error_keeps_the_checkpoint_and_other_types_continue(conn, fake_cli
     assert any(e.startswith("deals:") for e in report.errors)
     # Progress is kept: a cleared cursor would re-walk potentially millions.
     assert cursor(conn, "deals") == "deals-page-2-cursor"
-    assert phase(conn, "deals") != "complete"
+    assert phase(conn, "deals") == "blocked"
     assert phase(conn, "contacts") == "complete"
 
 
@@ -221,7 +221,7 @@ def test_estimate_reports_record_count_and_request_count_per_type(conn, fake_cli
     assert all(isinstance(e, Estimate) for e in est)
     assert [e.object_type for e in est] == BACKFILL_ORDER
     assert est[0].object_type == "owners"
-    assert est[0].requests == math.ceil(est[0].records / 100)
+    assert est[0].records is None and est[0].requests == 0   # unknown, not -1
     by_type = {e.object_type: e for e in est}
     assert (by_type["companies"].records, by_type["companies"].requests) == (250, 3)
     assert (by_type["deals"].records, by_type["deals"].requests) == (101, 2)
@@ -251,3 +251,119 @@ def test_progress_callback_invoked_per_page(conn, fake_client):
     backfill(conn, fake_client, progress=lambda t, n: seen.append((t, n)))
     assert [n for t, n in seen if t == "deals"] == [2, 4, 6]   # running totals
     assert {t for t, _ in seen} >= {"owners", "companies", "deals", "contacts"}
+
+
+def status(conn, object_type):
+    return conn.execute("SELECT status FROM sync_state WHERE object_type = ?",
+                        (object_type,)).fetchone()[0]
+
+
+def test_watermark_is_labelled_provisional_from_the_first_write(conn, fake_client):
+    """The start-time watermark and phase='backfill' commit together, so a
+    reader can never see a watermark on a type that is still empty."""
+    original = fake_client.list_page
+
+    def die_on_deals(object_type, after, archived=False):
+        if object_type == "deals":
+            raise RateLimited("first deals page")
+        return original(object_type, after, archived)
+
+    fake_client.list_page = die_on_deals
+    with pytest.raises(RateLimited):
+        backfill(conn, fake_client)
+    assert watermark(conn, "deals") > 0
+    assert phase(conn, "deals") == "backfill"
+    assert cursor(conn, "deals") is None
+
+
+def test_phase_is_backfill_mid_walk_and_complete_after(conn, fake_client):
+    fake_client.pages["deals"] = 3
+    fake_client.fail_on_page = 3
+    with pytest.raises(RateLimited):
+        backfill(conn, fake_client)
+    assert phase(conn, "deals") == "backfill"
+    assert backfill_pending(conn, "deals")
+    fake_client.fail_on_page = None
+    backfill(conn, fake_client)
+    assert phase(conn, "deals") == "complete"
+    assert not backfill_pending(conn, "deals")
+
+
+def test_incremental_refuses_a_type_mid_backfill_and_keeps_its_checkpoint(
+        conn, fake_client):
+    fake_client.pages["deals"] = 3
+    fake_client.fail_on_page = 3
+    with pytest.raises(RateLimited):
+        backfill(conn, fake_client)
+    checkpoint = cursor(conn, "deals")
+    mark = watermark(conn, "deals")
+    fake_client.fail_on_page = None
+    fake_client.reset_calls()
+    report = sync_incremental(conn, fake_client, ["deals"])
+    assert fake_client.search_calls == []
+    assert any(e.startswith("deals:") for e in report.errors)
+    assert report.per_type["deals"] == 0
+    assert cursor(conn, "deals") == checkpoint
+    assert watermark(conn, "deals") == mark
+    assert phase(conn, "deals") == "backfill"
+
+
+def test_incremental_refuses_a_blocked_type(conn, fake_client):
+    fake_client.pages["deals"] = 3
+    fake_client.set_pages("deals", [FakePage(records=[
+        {"id": "1", "properties": {"hs_lastmodifieddate": "not-a-date"}}])])
+    backfill(conn, fake_client)
+    fake_client.reset_calls()
+    report = sync_incremental(conn, fake_client, ["deals"])
+    assert fake_client.search_calls == []
+    assert any("backfill not complete" in e for e in report.errors)
+
+
+def test_deterministic_error_is_persisted_as_blocked_with_cursor_kept(
+        conn, fake_client):
+    fake_client.set_pages("deals", [
+        FakePage(records=[{"id": "1", "properties": {}}]),
+        FakePage(records=[{"id": "2", "properties": {
+            "hs_lastmodifieddate": "not-a-date"}}]),
+    ])
+    report = backfill(conn, fake_client)
+    assert report.errors
+    assert phase(conn, "deals") == "blocked"
+    assert status(conn, "deals").startswith("blocked:")
+    assert cursor(conn, "deals") == "deals-page-2-cursor"
+    # The next run does not call it complete either.
+    again = backfill(conn, fake_client)
+    assert again.errors and phase(conn, "deals") == "blocked"
+    assert backfill_pending(conn, "deals")
+
+
+def test_blocked_type_resumes_and_completes_once_fixed(conn, fake_client):
+    bad = FakePage(records=[{"id": "2", "properties": {
+        "hs_lastmodifieddate": "not-a-date"}}])
+    fake_client.set_pages("deals", [
+        FakePage(records=[{"id": "1", "properties": {}}]), bad])
+    backfill(conn, fake_client)
+    fake_client.set_pages("deals", [
+        FakePage(records=[{"id": "1", "properties": {}}]),
+        FakePage(records=[{"id": "2", "properties": {}}])])
+    fake_client.reset_calls()
+    backfill(conn, fake_client)
+    assert phase(conn, "deals") == "complete"
+    assert ids(conn) == ["1", "2"]
+    assert [c.after for c in fake_client.list_calls
+            if c.object_type == "deals"] == ["deals-page-2-cursor"]
+
+
+def test_rate_limited_pipelines_does_not_abort_the_backfill(conn, fake_client):
+    def limited(object_type):
+        raise RateLimited("pipelines throttled")
+
+    fake_client.list_pipelines = limited
+    report = backfill(conn, fake_client)
+    assert any(e.startswith("pipelines:") for e in report.errors)
+    assert phase(conn, "deals") == "complete"
+
+
+def test_estimate_page_size_is_the_clients():
+    from crm import hubspot, sync
+    assert sync.PAGE_SIZE is hubspot.PAGE_SIZE

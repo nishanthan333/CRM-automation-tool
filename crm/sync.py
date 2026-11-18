@@ -25,6 +25,7 @@ import httpx
 from crm.db import upsert, upsert_sql
 from crm.hubspot import (
     ENGAGEMENT_TYPES,
+    PAGE_SIZE,
     MODIFIED_PROPERTY,
     PROPERTIES,
     RateLimited,
@@ -429,6 +430,14 @@ def sync_incremental(conn: sqlite3.Connection, client,
 
     _refresh_reference_data(conn, client, report)
     for object_type in requested:
+        if backfill_pending(conn, object_type):
+            # A backfill owns this type's cursor and watermark. A search run
+            # would hand its list cursor to /search, clear it on the rejection,
+            # and advance the (provisional) watermark past unwalked records.
+            report.errors.append(
+                f"{object_type}: backfill not complete; run backfill first")
+            report.per_type[object_type] = 0
+            continue
         report.per_type[object_type] = _sync_object_type(
             conn, client, object_type, report)
     return report
@@ -441,15 +450,43 @@ def sync_incremental(conn: sqlite3.Connection, client,
 # refreshed before the walk. Owners are a small full refresh.
 BACKFILL_ORDER = ["owners", "companies", "deals", "contacts", "engagements"]
 
-BACKFILL_PAGE_SIZE = 100   # matches crm.hubspot.PAGE_SIZE
-UNKNOWN_COUNT = -1         # owners: no /search endpoint, so no cheap total
 COMPLETE = "complete"
+# While a walk is in flight `last_modified_ms` is only the walk's start time, a
+# provisional value. `phase` says so; NULL means the type was never backfilled.
+IN_PROGRESS = "backfill"
+BLOCKED = "blocked"   # `status` then reads "blocked: <error>"; cursor kept
+
+
+def backfill_pending(conn: sqlite3.Connection, object_type: str) -> bool:
+    """True if any api type of `object_type` is mid-backfill or blocked, i.e.
+    its watermark and cursor belong to the backfill, not to incremental."""
+    return any(_state(conn, t, "phase") in (IN_PROGRESS, BLOCKED)
+               for t in api_types(object_type))
+
+
+def _begin_walk(conn: sqlite3.Connection, api_type: str, fresh: bool) -> None:
+    """Mark the type in progress; on a fresh walk also stamp its start time,
+    in the same transaction so the watermark is never unlabelled."""
+    fields: dict = {"phase": IN_PROGRESS}
+    if fresh:
+        fields["last_modified_ms"] = _now_ms()
+    with conn:
+        conn.execute(*_state_sql(api_type, fields))
+
+
+def _block(conn: sqlite3.Connection, api_type: str, exc: Exception) -> None:
+    """Durably record a deterministic failure, keeping the cursor."""
+    with conn:
+        conn.execute(*_state_sql(api_type, {
+            "phase": BLOCKED, "status": f"blocked: {exc}",
+            "last_run_at": _now_ms(),
+        }))
 
 
 @dataclass
 class Estimate:
     object_type: str
-    records: int          # UNKNOWN_COUNT when the API cannot say
+    records: int | None   # None when the API cannot say (owners)
     requests: int         # list requests only; associations are extra
 
 
@@ -468,13 +505,12 @@ def _walk_type(conn: sqlite3.Connection, client, api_type: str,
     """
     table = table_for(api_type)
     after = cursor(conn, api_type)
-    if after is None:
-        # List order is by id, not modified date, so the max modified seen is
-        # not a safe watermark: a record walked early and edited later can sit
-        # below it and be missed forever. The walk's start time is safe, and
-        # incremental sync re-reads everything modified since. A resumed walk
-        # (cursor set) keeps the start time stored by its first run.
-        set_watermark(conn, api_type, _now_ms())
+    # List order is by id, not modified date, so the max modified seen is
+    # not a safe watermark: a record walked early and edited later can sit
+    # below it and be missed forever. The walk's start time is safe, and
+    # incremental sync re-reads everything modified since. A resumed walk
+    # (cursor set) keeps the start time stored by its first run.
+    _begin_walk(conn, api_type, fresh=after is None)
     count = 0
     while True:
         page = client.list_page(api_type, after)
@@ -513,20 +549,25 @@ def backfill(conn: sqlite3.Connection, client,
     report = SyncReport()
     try:
         refresh_pipelines(conn, client)
-    except _TYPE_ERRORS as exc:
+    except (RateLimited, *_TYPE_ERRORS) as exc:
+        # Two cheap requests must not gate an hours-long job.
         report.errors.append(f"pipelines: {exc}")
     for object_type in BACKFILL_ORDER:
         count = 0
-        try:
-            for api_type in api_types(object_type):
-                if _is_complete(conn, api_type):
-                    continue
+        for api_type in api_types(object_type):
+            if _is_complete(conn, api_type):
+                continue
+            try:
                 if api_type == "owners":
                     count += _backfill_owners(conn, client, progress)
                 else:
                     count += _walk_type(conn, client, api_type, progress)
-        except _TYPE_ERRORS as exc:
-            report.errors.append(f"{object_type}: {exc}")
+            except _TYPE_ERRORS as exc:
+                # Durable, so a later process (the CLI) can see the type is
+                # wedged and where. The cursor is kept; see the docstring.
+                _block(conn, api_type, exc)
+                report.errors.append(f"{api_type}: {exc}")
+                break
         report.per_type[object_type] = count
     return report
 
@@ -536,10 +577,10 @@ def estimate_backfill(conn: sqlite3.Connection, client) -> list[Estimate]:
     estimates = []
     for object_type in BACKFILL_ORDER:
         if object_type == "owners":
-            estimates.append(Estimate("owners", UNKNOWN_COUNT, 0))
+            estimates.append(Estimate("owners", None, 0))
             continue
         counts = [client.count(t) for t in api_types(object_type)]
         estimates.append(Estimate(
             object_type, sum(counts),
-            sum(math.ceil(n / BACKFILL_PAGE_SIZE) for n in counts)))
+            sum(math.ceil(n / PAGE_SIZE) for n in counts)))
     return estimates

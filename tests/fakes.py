@@ -64,6 +64,7 @@ class FakeClient:
         self.ids_only_calls: list[Call] = []
         self.assoc_calls: list[Call] = []
         self.pipeline_calls = 0
+        self.account = {"portalId": 4242, "uiDomain": "app-eu1.hubspot.com"}
         self._requests: dict[str, int] = {}
 
     # -- setup -----------------------------------------------------------
@@ -151,6 +152,9 @@ class FakeClient:
             kind="assoc", from_type=from_type, to_type=to_type, ids=list(ids)))
         links = self.associations.get((from_type, to_type), {})
         return {i: list(links.get(i, [])) for i in ids}
+
+    def account_details(self) -> dict:
+        return dict(self.account)
 
     def list_pipelines(self, object_type: str) -> list[dict]:
         self.pipeline_calls += 1

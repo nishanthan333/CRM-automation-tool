@@ -50,6 +50,9 @@ CREATE TABLE IF NOT EXISTS signal_results (
     signal_id TEXT, record_id TEXT, record_type TEXT, owner_id TEXT,
     value REAL, computed_at INTEGER
 );
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY, value TEXT
+);
 CREATE TABLE IF NOT EXISTS snoozes (
     signal_id TEXT NOT NULL, record_type TEXT NOT NULL, record_id TEXT NOT NULL,
     until INTEGER, created_at INTEGER, fingerprint TEXT,

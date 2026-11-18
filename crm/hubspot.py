@@ -146,5 +146,9 @@ class HubSpotClient:
                 out[str(row["from"]["id"])] = [str(t["toObjectId"]) for t in row.get("to", [])]
         return out
 
+    def account_details(self) -> dict:
+        """The portal id and UI domain, needed to build links back to HubSpot."""
+        return self._request("GET", "/account-info/v3/details")
+
     def list_pipelines(self, object_type: str) -> list[dict]:
         return self._request("GET", f"/crm/v3/pipelines/{object_type}").get("results", [])

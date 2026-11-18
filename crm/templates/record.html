@@ -4,7 +4,8 @@
 {% block content %}
 <p><a href="/">← Needs attention</a></p>
 <h1>{{ title }}</h1>
-<p><a href="{{ hubspot_link }}" rel="noopener noreferrer" target="_blank">Open in HubSpot ↗</a>
+<p>{% if hubspot_link %}<a href="{{ hubspot_link }}" rel="noopener noreferrer" target="_blank">Open in HubSpot ↗</a>
+  {% else %}<span class="muted">Run a sync to enable the link back to HubSpot.</span>{% endif %}
   <span class="muted">({{ record_type }} {{ record_id }})</span></p>
 {% if archived %}<p class="banner warn">This record is archived in HubSpot.</p>{% endif %}
 
@@ -24,8 +25,8 @@
 </dl>
 
 <h2>Activity</h2>
-{% if engagements is none %}
-<p class="muted">Activity history unavailable: HubSpot could not be reached just now. The flags above do not depend on it.</p>
+{% if engagements.unavailable %}
+<p class="muted">Activity history unavailable: {{ engagements.unavailable }}. The flags above do not depend on it.</p>
 {% elif not engagements.total %}
 <p class="muted">No engagements are associated with this record.</p>
 {% else %}

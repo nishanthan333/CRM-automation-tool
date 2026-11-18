@@ -26,7 +26,8 @@ import sqlite3
 
 __all__ = [
     "SIGNALS", "OwnerRollup", "Signal", "SignalSummary", "briefing",
-    "evaluate_all", "explain", "flagged_records", "total_at_risk",
+    "evaluate_all", "explain", "flagged_page", "flagged_records",
+    "flags_for_record", "owner_rollups", "total_at_risk",
 ]
 
 DAY_MS = 86_400_000
@@ -391,3 +392,79 @@ def total_at_risk(conn: sqlite3.Connection, now_ms: int | None = None) -> float:
             per_deal[r["record_id"]] = max(
                 per_deal.get(r["record_id"], 0.0), r["value"] or 0.0)
     return float(sum(per_deal.values()))
+
+
+# --- narrow reads for the dashboard's drill-downs --------------------------------
+# The dashboard's signal and record pages must not load every flag to show a few,
+# so these filter and page in SQL. Snoozes are applied exactly as in
+# `flagged_records`.
+
+_SNOOZE_JOIN = ("LEFT JOIN snoozes z ON z.signal_id = r.signal_id"
+                " AND z.record_type = r.record_type"
+                " AND z.record_id = r.record_id AND z.until > :now_ms")
+_FLAG_COLUMNS = ("r.signal_id, r.record_id, r.record_type, r.owner_id, r.value,"
+                 " o.first_name, o.last_name, o.email")
+
+
+def _enabled(signal_id: str) -> bool:
+    return any(s.id == signal_id for s in _ENABLED)
+
+
+def flagged_page(conn: sqlite3.Connection, now_ms: int, signal_id: str, *,
+                 owner_id: str | None = None, unassigned: bool = False,
+                 limit: int, offset: int) -> tuple[int, list[sqlite3.Row]]:
+    """(total, one page) of a signal's visible flags, highest value first.
+
+    `owner_id` narrows to one owner; `unassigned=True` to flags with none.
+    """
+    if not _enabled(signal_id):
+        return 0, []
+    where = "r.signal_id = :signal_id AND z.signal_id IS NULL"
+    params: dict = {"now_ms": now_ms, "signal_id": signal_id}
+    if unassigned:
+        where += " AND r.owner_id IS NULL"
+    elif owner_id is not None:
+        where += " AND r.owner_id = :owner_id"
+        params["owner_id"] = owner_id
+    base = (f"FROM signal_results r LEFT JOIN owners o ON o.id = r.owner_id "
+            f"{_SNOOZE_JOIN} WHERE {where}")
+    total = conn.execute(f"SELECT COUNT(*) {base}", params).fetchone()[0]
+    rows = conn.execute(
+        f"SELECT {_FLAG_COLUMNS} {base} ORDER BY r.value DESC, r.record_id"
+        " LIMIT :limit OFFSET :offset",
+        {**params, "limit": limit, "offset": offset}).fetchall()
+    return total, rows
+
+
+def owner_rollups(conn: sqlite3.Connection, now_ms: int,
+                  signal_id: str) -> list[OwnerRollup]:
+    """Per-owner counts and value for one signal, same order as `briefing`."""
+    if not _enabled(signal_id):
+        return []
+    rows = conn.execute(f"""
+SELECT r.owner_id, o.first_name, o.last_name, o.email,
+       COUNT(*) AS n, COALESCE(SUM(r.value), 0.0) AS v
+FROM signal_results r LEFT JOIN owners o ON o.id = r.owner_id {_SNOOZE_JOIN}
+WHERE r.signal_id = :signal_id AND z.signal_id IS NULL
+GROUP BY r.owner_id""", {"now_ms": now_ms, "signal_id": signal_id}).fetchall()
+    out = [OwnerRollup(r["owner_id"], _owner_label(r), r["n"], r["v"])
+           for r in rows]
+    out.sort(key=lambda o: (-o.total_value, -o.count, o.label))
+    return out
+
+
+def flags_for_record(conn: sqlite3.Connection, now_ms: int, record_type: str,
+                     record_id: str) -> list[sqlite3.Row]:
+    """The visible flags on one record, across signals."""
+    params: dict = {"now_ms": now_ms, "record_type": record_type,
+                    "record_id": record_id}
+    names = []
+    for n, sig in enumerate(_ENABLED):
+        params[f"s{n}"] = sig.id
+        names.append(f":s{n}")
+    return conn.execute(
+        f"SELECT {_FLAG_COLUMNS} FROM signal_results r"
+        f" LEFT JOIN owners o ON o.id = r.owner_id {_SNOOZE_JOIN}"
+        " WHERE z.signal_id IS NULL AND r.record_type = :record_type"
+        f" AND r.record_id = :record_id AND r.signal_id IN ({', '.join(names)})",
+        params).fetchall()

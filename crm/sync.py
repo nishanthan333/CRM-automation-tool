@@ -40,7 +40,7 @@ __all__ = [
     "ASSOCIATION_PAIRS", "INCREMENTAL_TYPES", "SEARCH_RESULT_CAP",
     "SEARCH_WINDOW_LIMIT", "SyncReport", "WATERMARK_REWIND_MS", "cursor",
     "normalise_record", "refresh_associations", "refresh_owners",
-    "refresh_pipelines", "set_cursor", "set_watermark", "sync_incremental",
+    "refresh_account", "refresh_pipelines", "set_cursor", "set_watermark", "sync_incremental",
     "to_epoch_ms", "watermark",
 ]
 
@@ -335,6 +335,20 @@ def refresh_pipelines(conn: sqlite3.Connection, client) -> None:
     upsert(conn, "stages", stages)
 
 
+def refresh_account(conn: sqlite3.Connection, client) -> None:
+    """Remember the portal id and UI domain (EU accounts are not app.hubspot.com)
+    so the dashboard can link a record back to HubSpot without a request."""
+    details = client.account_details()
+    portal, domain = details.get("portalId"), details.get("uiDomain")
+    if portal is None or not domain:
+        raise ValueError("account details lacked portalId or uiDomain")
+    with conn:
+        conn.executemany(
+            "INSERT INTO meta (key, value) VALUES (?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [("portal_id", str(portal)), ("ui_domain", str(domain))])
+
+
 def refresh_owners(conn: sqlite3.Connection, client) -> int:
     """Owners have no /search endpoint, so they are refreshed in full."""
     after, count = None, 0
@@ -409,7 +423,8 @@ def _refresh_reference_data(conn: sqlite3.Connection, client,
     """Pipelines and owners are refreshed in full, and must not gate the
     object sync they merely support, so even a RateLimited is recorded here."""
     for name, refresh in (("pipelines", refresh_pipelines),
-                          ("owners", refresh_owners)):
+                          ("owners", refresh_owners),
+                          ("account", refresh_account)):
         try:
             refresh(conn, client)
         except (RateLimited, *_TYPE_ERRORS) as exc:

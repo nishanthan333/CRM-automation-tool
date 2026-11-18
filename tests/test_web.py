@@ -136,7 +136,10 @@ def test_index_says_when_data_is_incomplete(seeded, fake_client):
             "INSERT INTO sync_state (object_type, phase, status) VALUES"
             " ('signals', 'partial',"
             " 'data incomplete: quiet_pipeline not re-evaluated')")
-    assert "data incomplete" in build(seeded, fake_client).get("/").text
+    body = build(seeded, fake_client).get("/").text
+    assert "<strong>Data incomplete.</strong>" in body
+    assert "quiet_pipeline not re-evaluated" in body
+    assert "data incomplete: " not in body      # not said twice
 
 
 def test_index_without_partial_marker_does_not_claim_incomplete(client):
@@ -154,8 +157,10 @@ def test_pipeline_shows_open_stage_with_count_and_value(client):
 
 
 def test_pipeline_owner_filter(client):
-    body = client.get("/?owner=o1").text
-    assert "1 deals" in body or "1 deal" in body
+    assert "2 deals ·" in client.get("/").text
+    filtered = client.get("/?owner=o1").text
+    assert "1 deal ·" in filtered and "2 deals" not in filtered
+    assert "0 deals ·" in client.get("/?owner=nobody").text
 
 
 # --- every flag explains itself --------------------------------------------------
@@ -208,8 +213,26 @@ def test_record_page_uses_hubspot_property_labels(client):
     assert "Qualify" in body and "Rhea Mehta" in body   # ids resolved to labels
 
 
-def test_record_page_links_back_to_hubspot(client):
-    assert "app.hubspot.com" in client.get("/record/deals/d1").text
+def test_record_page_links_back_to_hubspot_with_portal_and_ui_domain(seeded, fake_client):
+    from crm.sync import sync_incremental
+    sync_incremental(seeded, fake_client)     # learns portalId / uiDomain
+    c = build(seeded, fake_client)
+    assert ('href="https://app-eu1.hubspot.com/contacts/4242/record/0-3/d1"'
+            in c.get("/record/deals/d1").text)
+    assert "/record/0-2/c1" in c.get("/record/companies/c1").text
+
+
+def test_record_page_has_no_link_until_account_is_known(client):
+    body = client.get("/record/deals/d1").text
+    assert "hubspot.com" not in body
+    assert "Run a sync to enable the link" in body
+
+
+def test_hubspot_link_ignores_a_hostile_ui_domain(seeded, fake_client):
+    with seeded:
+        seeded.executemany("INSERT INTO meta VALUES (?, ?)", [
+            ("portal_id", "4242"), ("ui_domain", "evil.example/x")])
+    assert "evil" not in build(seeded, fake_client).get("/record/deals/d1").text
 
 
 def test_record_page_explains_why_it_is_flagged(client):
@@ -313,9 +336,18 @@ def test_sync_reports_errors_from_the_run(seeded, fake_client):
         raise RateLimited("slow down")
     fake_client.list_pipelines = boom
     c = build(seeded, fake_client)
-    assert c.post("/sync", follow_redirects=True).status_code == 200
-    body = c.get("/").text
-    assert "Sync finished with errors" in body and "slow down" in body
+    r = c.post("/sync", follow_redirects=True)
+    assert r.status_code == 200
+    assert "Sync finished with errors" in r.text and "slow down" in r.text
+
+
+def test_sync_notice_is_shown_once_then_cleared(seeded, fake_client):
+    def boom(*a, **k):
+        raise RuntimeError("kaboom")
+    fake_client.search_modified_since = boom
+    c = build(seeded, fake_client)
+    assert "Sync failed" in c.post("/sync", follow_redirects=True).text
+    assert "Sync failed" not in c.get("/").text
 
 
 def test_sync_crash_does_not_500(seeded, fake_client):
@@ -323,5 +355,61 @@ def test_sync_crash_does_not_500(seeded, fake_client):
         raise RuntimeError("kaboom")
     fake_client.search_modified_since = boom
     c = build(seeded, fake_client)
-    assert c.post("/sync", follow_redirects=True).status_code == 200
-    assert "Sync failed" in c.get("/").text
+    r = c.post("/sync", follow_redirects=True)
+    assert r.status_code == 200 and "Sync failed" in r.text
+
+
+# --- same-origin guard -------------------------------------------------------------
+
+POSTS = [("/sync", {}), ("/ask", {"question": "x"}),
+         ("/snooze", {"signal_id": "stalled_deal", "record_id": "d1", "days": 7})]
+
+
+def test_cross_origin_posts_are_refused(client, fake_client):
+    for url, data in POSTS:
+        for header in ({"Origin": "http://evil.example"},
+                       {"Origin": "null"},
+                       {"Referer": "http://evil.example/page"}):
+            r = client.post(url, data=data, headers=header, follow_redirects=False)
+            assert r.status_code == 403, (url, header)
+    assert not fake_client.search_calls
+    assert "Acme renewal" in client.get("/signal/stalled_deal").text   # not snoozed
+
+
+def test_same_origin_posts_are_allowed(client):
+    for url, data in POSTS:
+        r = client.post(url, data=data, follow_redirects=False,
+                        headers={"Origin": "http://testserver",
+                                 "Referer": "http://testserver/"})
+        assert r.status_code in (200, 303), url
+
+
+# --- more escaping, and the engagement failure reasons -------------------------------
+
+def test_owner_stage_and_company_names_are_escaped(seeded, fake_client):
+    evil = "<img src=x onerror=alert(1)>"
+    with seeded:
+        seeded.execute("UPDATE owners SET first_name = ?, last_name = ''", (evil,))
+        seeded.execute("UPDATE stages SET label = ?", (evil,))
+        seeded.execute("UPDATE companies SET name = ?", (evil,))
+        seeded.execute("UPDATE pipelines SET label = ?", (evil,))
+    c = build(seeded, fake_client)
+    urls = ["/", "/?owner=o1", "/signal/stalled_deal", "/signal/untouched_account",
+            "/record/deals/d1", "/record/companies/c1"]
+    for url in urls:
+        body = c.get(url).text
+        assert evil not in body, url
+    assert "&lt;img src=x onerror=alert(1)&gt;" in c.get("/").text
+    assert "&lt;img" in c.get("/record/deals/d1").text
+
+
+def test_engagement_failure_reason_distinguishes_a_bad_token(client, fake_client, caplog):
+    def denied(*a, **k):
+        request = httpx.Request("POST", "https://api.hubapi.com/x")
+        raise httpx.HTTPStatusError("401", request=request,
+                                    response=httpx.Response(401, request=request))
+    fake_client.batch_associations = denied
+    with caplog.at_level("WARNING", logger="crm.web"):
+        body = client.get("/record/deals/d1").text
+    assert "rejected the token" in body
+    assert "HTTPStatusError" in caplog.text        # not swallowed silently

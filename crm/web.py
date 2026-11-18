@@ -10,16 +10,22 @@ Jinja's autoescape; nothing here marks a value `safe`.
 
 from __future__ import annotations
 
+import logging
 import math
+import re
 import sqlite3
 import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable
+from urllib.parse import quote, urlsplit
 
-from fastapi import FastAPI, Form, HTTPException, Query, Request
+import httpx
+
+from fastapi import Depends, FastAPI, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from jinja2 import Environment, FileSystemLoader, select_autoescape
@@ -28,14 +34,15 @@ from crm.ask import ask
 from crm.config import Config, home_dir, load_thresholds
 from crm.db import connect, migrate
 from crm.hubspot import HubSpotClient
-from crm.signals import (SIGNALS, UNASSIGNED, briefing, explain,
-                         flagged_records, total_at_risk)
+from crm.signals import (SIGNALS, UNASSIGNED, briefing, explain, flagged_page,
+                         flags_for_record, owner_rollups, total_at_risk)
 from crm.snooze import SNOOZE_FIELDS, snooze
 from crm.sync import sync_incremental
 
 __all__ = ["LABELS", "PAGE_SIZE", "create_app"]
 
 HERE = Path(__file__).parent
+log = logging.getLogger(__name__)
 PAGE_SIZE = 50
 OWNERS_SHOWN = 5            # owner rows on an index card before "… N more"
 ENGAGEMENTS_SHOWN = 20
@@ -100,11 +107,20 @@ def _stamp(ms: int, day_only: bool) -> str:
     return when.strftime("%Y-%m-%d" if day_only else "%Y-%m-%d %H:%M UTC")
 
 
-def hubspot_url(record_type: str, record_id: str) -> str:
-    # The portal id is not synced, so the link relies on HubSpot resolving "_"
-    # to the signed-in user's portal.
-    return (f"https://app.hubspot.com/contacts/_/record/"
-            f"{HUBSPOT_TYPE_ID[record_type]}/{record_id}")
+_HUBSPOT_HOST = re.compile(r"^[a-z0-9.-]+\.hubspot\.com$")
+
+
+def hubspot_url(conn: sqlite3.Connection, record_type: str,
+                record_id: str) -> str | None:
+    """Link to the record in HubSpot, or None until a sync has learned the
+    portal id and UI domain (EU accounts are not app.hubspot.com)."""
+    meta = {r["key"]: r["value"] for r in conn.execute(
+        "SELECT key, value FROM meta WHERE key IN ('portal_id', 'ui_domain')")}
+    portal, domain = meta.get("portal_id"), meta.get("ui_domain")
+    if not (portal and portal.isdigit() and domain and _HUBSPOT_HOST.match(domain)):
+        return None
+    return (f"https://{domain}/contacts/{portal}/record/"
+            f"{HUBSPOT_TYPE_ID[record_type]}/{quote(record_id, safe='')}")
 
 
 def _owner_label(row: sqlite3.Row | None, owner_id: str | None) -> str:
@@ -141,7 +157,9 @@ def _chrome(conn: sqlite3.Connection, now_ms: int, notice) -> dict:
     signals = _state(conn, "signals")
     partial = None
     if signals is not None and signals["phase"] == "partial":
-        partial = signals["status"] or "data incomplete"
+        # The banner supplies the "Data incomplete." heading itself.
+        partial = re.sub(r"^\s*data incomplete:?\s*", "",
+                         signals["status"] or "", flags=re.I) or "Some data is missing"
     return {"last_sync": ago(last, now_ms), "partial": partial, "notice": notice}
 
 
@@ -227,16 +245,20 @@ def _names(conn: sqlite3.Connection, record_type: str,
 def _signal_context(conn: sqlite3.Connection, now_ms: int, signal_id: str,
                     owner: str | None, page: int) -> dict:
     sig = SIGNAL_BY_ID[signal_id]
-    summary = next((s for s in briefing(conn, now_ms)
-                    if s.signal_id == signal_id), None)
-    rows = flagged_records(conn, now_ms, signal_id)
+    rollups = owner_rollups(conn, now_ms, signal_id)
+    flagged_total = sum(o.count for o in rollups)
     if owner == NO_OWNER:
-        rows = [r for r in rows if r["owner_id"] is None]
+        total = sum(o.count for o in rollups if o.owner_id is None)
     elif owner:
-        rows = [r for r in rows if r["owner_id"] == owner]
-    pages = max(math.ceil(len(rows) / PAGE_SIZE), 1)
+        total = sum(o.count for o in rollups if o.owner_id == owner)
+    else:
+        total = flagged_total
+    pages = max(math.ceil(total / PAGE_SIZE), 1)
     page = min(page, pages)
-    shown = rows[(page - 1) * PAGE_SIZE: page * PAGE_SIZE]
+    _, shown = flagged_page(
+        conn, now_ms, signal_id, owner_id=None if owner == NO_OWNER else owner,
+        unassigned=owner == NO_OWNER, limit=PAGE_SIZE,
+        offset=(page - 1) * PAGE_SIZE)
     names: dict[str, dict[str, str]] = {}
     for record_type in {r["record_type"] for r in shown}:
         names[record_type] = _names(
@@ -249,12 +271,14 @@ def _signal_context(conn: sqlite3.Connection, now_ms: int, signal_id: str,
         "link": r["record_type"] in RECORD_TABLES,
         "snoozable": r["record_type"] in SNOOZE_FIELDS,
     } for r in shown]
+    summary = SimpleNamespace(
+        count=flagged_total, total_value=sum(o.total_value for o in rollups),
+        by_owner=rollups) if rollups else None
     return {
         "signal": _rule(sig, _thresholds()),
         "summary": summary, "owner": owner, "records": records,
-        "total": len(rows), "page": page, "pages": pages, "page_size": PAGE_SIZE,
-        "owner_names": {o.owner_id or NO_OWNER: o.label
-                        for o in (summary.by_owner if summary else [])},
+        "total": total, "page": page, "pages": pages, "page_size": PAGE_SIZE,
+        "owner_names": {o.owner_id or NO_OWNER: o.label for o in rollups},
     }
 
 
@@ -280,8 +304,8 @@ def _present(conn: sqlite3.Connection, column: str, value) -> str:
 
 
 def _engagements(client, conn: sqlite3.Connection, record_type: str,
-                 record_id: str) -> dict | None:
-    """This record's engagements, fetched now. None means "unavailable".
+                 record_id: str) -> dict:
+    """This record's engagements, fetched now. `unavailable` holds the reason.
 
     The briefing never depends on this, so any failure (rate limit, network,
     a bad token) degrades to a notice instead of failing the page.
@@ -289,8 +313,14 @@ def _engagements(client, conn: sqlite3.Connection, record_type: str,
     try:
         links = client.batch_associations(record_type, "engagements", [record_id])
         ids = [str(i) for i in links.get(record_id, [])]
-    except Exception:  # noqa: BLE001 - deliberately never fails the page
-        return None
+    except Exception as exc:  # noqa: BLE001 - deliberately never fails the page
+        log.warning("engagement fetch for %s %s failed: %s: %s",
+                    record_type, record_id, type(exc).__name__, exc)
+        if (isinstance(exc, httpx.HTTPStatusError)
+                and exc.response.status_code in (401, 403)):
+            return {"unavailable": "HubSpot rejected the token or its scopes; "
+                    "check the private app's read access"}
+        return {"unavailable": "HubSpot could not be reached just now"}
     found: list[sqlite3.Row] = []
     for start in range(0, len(ids), 500):
         chunk = ids[start:start + 500]
@@ -326,7 +356,6 @@ def create_app(cfg: Config, *, client=None, http=None,
     env = Environment(loader=FileSystemLoader(HERE / "templates"),
                       autoescape=select_autoescape(["html"]))
     env.filters["money"] = money
-    env.globals["hubspot_url"] = hubspot_url
     app = FastAPI(title="HubSpot Watchdog", docs_url=None, redoc_url=None,
                   openapi_url=None)
     app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
@@ -344,7 +373,9 @@ def create_app(cfg: Config, *, client=None, http=None,
             connection.close()
 
     def render(template: str, conn: sqlite3.Connection, **ctx) -> HTMLResponse:
-        ctx.update(chrome=_chrome(conn, now(), app.state.notice))
+        # A notice describes the last sync once; it must not outlive being shown.
+        notice, app.state.notice = app.state.notice, None
+        ctx.update(chrome=_chrome(conn, now(), notice))
         return HTMLResponse(env.get_template(template).render(**ctx))
 
     def hubspot(max_attempts: int | None = None):
@@ -353,13 +384,26 @@ def create_app(cfg: Config, *, client=None, http=None,
         return HubSpotClient(cfg.hubspot_token,
                              **({"max_attempts": max_attempts} if max_attempts else {}))
 
+    def same_origin(request: Request) -> None:
+        """Refuse a cross-site POST (CSRF) against this localhost tool.
+
+        A browser sends Origin (or at least Referer) on a cross-site form
+        post; when one is present it must name this host. Requests with
+        neither (curl, scripts) are not browser CSRF and pass.
+        """
+        host = request.headers.get("host", "")
+        for header in ("origin", "referer"):
+            value = request.headers.get(header)
+            if value is not None and urlsplit(value).netloc != host:
+                raise HTTPException(403, "Cross-origin request refused")
+
     @app.get("/", response_class=HTMLResponse)
     def index(owner: str | None = Query(None, max_length=64)):
         with db() as conn:
             return render("index.html", conn, ask=None, question="",
                           **_index_context(conn, now(), owner))
 
-    @app.post("/ask", response_class=HTMLResponse)
+    @app.post("/ask", response_class=HTMLResponse, dependencies=[Depends(same_origin)])
     def ask_route(question: str = Form("", max_length=2000)):
         with db() as conn:
             result = ask(question, conn, cfg, http=http)
@@ -388,20 +432,18 @@ def create_app(cfg: Config, *, client=None, http=None,
             fields = [{"label": labels.get(c, c),
                        "value": _present(conn, c, row[c])}
                       for c in row.keys() if c not in ("id", "raw", "archived")]
-            flags = []
-            for f in flagged_records(conn, now()):
-                if f["record_type"] == record_type and f["record_id"] == record_id:
-                    sig = SIGNAL_BY_ID[f["signal_id"]]
-                    flags.append(_rule(sig, _thresholds()))
+            thresholds = _thresholds()
+            flags = [_rule(SIGNAL_BY_ID[f["signal_id"]], thresholds)
+                     for f in flags_for_record(conn, now(), record_type, record_id)]
             return render(
                 "record.html", conn, record_type=record_type, record_id=record_id,
                 title=row[{"deals": "dealname", "companies": "name"}.get(
                     record_type, "email")] or record_id,
                 archived=bool(row["archived"]), fields=fields, flags=flags,
-                hubspot_link=hubspot_url(record_type, record_id),
+                hubspot_link=hubspot_url(conn, record_type, record_id),
                 engagements=_engagements(hubspot(2), conn, record_type, record_id))
 
-    @app.post("/snooze")
+    @app.post("/snooze", dependencies=[Depends(same_origin)])
     def snooze_route(signal_id: str = Form(..., max_length=64),
                      record_id: str = Form(..., max_length=64),
                      record_type: str = Form("deals", max_length=32),
@@ -414,7 +456,7 @@ def create_app(cfg: Config, *, client=None, http=None,
                 raise HTTPException(400, str(exc)) from exc
         return RedirectResponse(f"/signal/{signal_id}", status_code=303)
 
-    @app.post("/sync")
+    @app.post("/sync", dependencies=[Depends(same_origin)])
     def sync_route():
         if not sync_lock.acquire(blocking=False):
             app.state.notice = "A sync is already running."

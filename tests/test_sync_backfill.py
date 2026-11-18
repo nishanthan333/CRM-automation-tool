@@ -367,3 +367,60 @@ def test_rate_limited_pipelines_does_not_abort_the_backfill(conn, fake_client):
 def test_estimate_page_size_is_the_clients():
     from crm import hubspot, sync
     assert sync.PAGE_SIZE is hubspot.PAGE_SIZE
+
+
+def die_on_deals(fake_client):
+    original = fake_client.list_page
+
+    def wrapper(object_type, after, archived=False):
+        if object_type == "deals":
+            raise RateLimited("throttled before the first page commits")
+        return original(object_type, after, archived)
+
+    fake_client.list_page = wrapper
+
+
+def test_stale_search_cursor_on_untouched_type_is_not_resumed(conn, fake_client,
+                                                              monkeypatch):
+    from crm.sync import set_cursor
+    monkeypatch.setattr("crm.sync._now_ms", lambda: 7_000)
+    fake_client.pages["deals"] = 2
+    set_cursor(conn, "deals", "a-search-cursor")        # phase stays NULL
+    assert phase(conn, "deals") is None
+    backfill(conn, fake_client)
+    deal_calls = [c.after for c in fake_client.list_calls if c.object_type == "deals"]
+    assert deal_calls == [None, "deals-page-2-cursor"]  # from page one
+    assert phase(conn, "deals") == "complete"
+    assert watermark(conn, "deals") == 7_000            # start time written
+    assert len(ids(conn)) == 4
+
+
+def test_stale_cursor_is_cleared_with_the_fresh_start_even_if_walk_dies(
+        conn, fake_client):
+    from crm.sync import set_cursor
+    set_cursor(conn, "deals", "a-search-cursor")
+    die_on_deals(fake_client)
+    with pytest.raises(RateLimited):
+        backfill(conn, fake_client)
+    assert cursor(conn, "deals") is None
+    assert phase(conn, "deals") == "backfill" and watermark(conn, "deals") > 0
+
+
+def test_resume_keeps_start_time_and_clears_stale_blocked_status(conn, fake_client,
+                                                                 monkeypatch):
+    now = {"t": 1_000}
+    monkeypatch.setattr("crm.sync._now_ms", lambda: now["t"])
+    fake_client.set_pages("deals", [
+        FakePage(records=[{"id": "1", "properties": {}}]),
+        FakePage(records=[{"id": "2", "properties": {
+            "hs_lastmodifieddate": "not-a-date"}}])])
+    backfill(conn, fake_client)
+    assert status(conn, "deals").startswith("blocked")
+    now["t"] = 9_000
+    die_on_deals(fake_client)
+    with pytest.raises(RateLimited):
+        backfill(conn, fake_client)
+    assert phase(conn, "deals") == "backfill"
+    assert status(conn, "deals") is None
+    assert cursor(conn, "deals") == "deals-page-2-cursor"
+    assert watermark(conn, "deals") == 1_000

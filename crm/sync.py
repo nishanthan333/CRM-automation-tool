@@ -25,8 +25,8 @@ import httpx
 from crm.db import upsert, upsert_sql
 from crm.hubspot import (
     ENGAGEMENT_TYPES,
-    PAGE_SIZE,
     MODIFIED_PROPERTY,
+    PAGE_SIZE,
     PROPERTIES,
     RateLimited,
 )
@@ -467,9 +467,13 @@ def backfill_pending(conn: sqlite3.Connection, object_type: str) -> bool:
 def _begin_walk(conn: sqlite3.Connection, api_type: str, fresh: bool) -> None:
     """Mark the type in progress; on a fresh walk also stamp its start time,
     in the same transaction so the watermark is never unlabelled."""
-    fields: dict = {"phase": IN_PROGRESS}
+    # `status` is cleared so a resumed, formerly blocked type is not mislabelled.
+    fields: dict = {"phase": IN_PROGRESS, "status": None}
     if fresh:
+        # Also drop any stale cursor, which may be a search cursor left by an
+        # incremental run and would be rejected by the list endpoint.
         fields["last_modified_ms"] = _now_ms()
+        fields["cursor"] = None
     with conn:
         conn.execute(*_state_sql(api_type, fields))
 
@@ -504,7 +508,11 @@ def _walk_type(conn: sqlite3.Connection, client, api_type: str,
     cursor never outruns them.
     """
     table = table_for(api_type)
-    after = cursor(conn, api_type)
+    # Only a cursor a backfill wrote is resumable. Anything else on a type that
+    # is not mid-backfill (a search cursor from a rate-limited incremental run)
+    # is stale: walk fresh.
+    resumable = _state(conn, api_type, "phase") in (IN_PROGRESS, BLOCKED)
+    after = cursor(conn, api_type) if resumable else None
     # List order is by id, not modified date, so the max modified seen is
     # not a safe watermark: a record walked early and edited later can sit
     # below it and be missed forever. The walk's start time is safe, and

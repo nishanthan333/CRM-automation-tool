@@ -94,19 +94,28 @@ def migrate(conn: sqlite3.Connection) -> None:
                 conn.execute(stmt)
 
 
-def upsert(conn: sqlite3.Connection, table: str, rows: list[dict]) -> int:
-    if not rows:
-        return 0
+def upsert_sql(conn: sqlite3.Connection, table: str, cols: list[str]) -> str:
+    """The `INSERT ... ON CONFLICT(id)` statement `upsert` executes.
+
+    Exposed so callers that need the write to share a transaction with other
+    statements (the sync layer checkpoints its cursor alongside each page) can
+    execute it inside a transaction of their own.
+    """
     known = {r["name"] for r in conn.execute(f'PRAGMA table_info("{table}")')}
-    cols = list(rows[0])
     if not known or "id" not in known or not set(cols) <= known:
         raise ValueError(f"cannot upsert into {table!r} with columns {cols}")
     names = ", ".join(f'"{c}"' for c in cols)
     marks = ", ".join(f":{c}" for c in cols)
     sets = ", ".join(f'"{c}"=excluded."{c}"' for c in cols if c != "id")
     action = f"DO UPDATE SET {sets}" if sets else "DO NOTHING"
-    sql = (f'INSERT INTO "{table}" ({names}) VALUES ({marks}) '
-           f"ON CONFLICT(id) {action}")
+    return (f'INSERT INTO "{table}" ({names}) VALUES ({marks}) '
+            f"ON CONFLICT(id) {action}")
+
+
+def upsert(conn: sqlite3.Connection, table: str, rows: list[dict]) -> int:
+    if not rows:
+        return 0
+    sql = upsert_sql(conn, table, list(rows[0]))
     with conn:
         conn.executemany(sql, rows)
     return len(rows)

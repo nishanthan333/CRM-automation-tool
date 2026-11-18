@@ -17,6 +17,7 @@ Tests set data up on the fake and then assert against the recorded calls:
     client.ids_only_calls -> list_ids_page() calls
     client.assoc_calls    -> [Call(kind="assoc", from_type=..., to_type=...,
                                    ids=[...])]
+    client.count_calls    -> [object_type, ...] for count() calls
     client.pipeline_calls -> int, number of list_pipelines() calls
 """
 from dataclasses import dataclass, field
@@ -51,6 +52,8 @@ class FakeClient:
         self.archived: dict[str, object] = {}       # archived=True listings
         self.remote_ids: dict[str, list[str]] = {}  # list_ids_page results
         self.pipelines: list[dict] = []
+        self.counts: dict[str, int] = {}            # count() results
+        self.count_calls: list[str] = []
         # (from_type, to_type) -> {from_id: [to_id, ...]}
         self.associations: dict[tuple[str, str], dict[str, list[str]]] = {}
         self.fail_on_page: int | None = None
@@ -71,6 +74,7 @@ class FakeClient:
         self.ids_only_calls.clear()
         self.assoc_calls.clear()
         self.pipeline_calls = 0
+        self.count_calls.clear()
         self._requests.clear()
 
     # -- paging ----------------------------------------------------------
@@ -139,3 +143,7 @@ class FakeClient:
     def list_pipelines(self, object_type: str) -> list[dict]:
         self.pipeline_calls += 1
         return [dict(p) for p in self.pipelines]
+
+    def count(self, object_type: str) -> int:
+        self.count_calls.append(object_type)
+        return self.counts.get(object_type, 0)

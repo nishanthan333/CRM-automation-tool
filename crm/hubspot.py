@@ -128,6 +128,14 @@ class HubSpotClient:
             self._request("POST", f"/crm/v3/objects/{object_type}/search", json=body)
         )
 
+    def count(self, object_type: str) -> int:
+        """Total records of a type. List responses carry no total; search's
+        `total` is the full match count (not capped at 10,000). A read-only
+        POST, and never paged. Owners have no /search endpoint."""
+        data = self._request(
+            "POST", f"/crm/v3/objects/{object_type}/search", json={"limit": 1})
+        return int(data["total"])
+
     def batch_associations(self, from_type: str, to_type: str, ids: list[str]) -> dict[str, list[str]]:
         out: dict[str, list[str]] = {i: [] for i in ids}
         path = f"/crm/v4/associations/{from_type}/{to_type}/batch/read"

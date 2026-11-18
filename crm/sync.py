@@ -13,10 +13,12 @@ Resume semantics, which the whole tool's trustworthiness rests on:
   what is stored. Re-processing a few records is free; missing one is not.
 """
 import json
+import math
 import sqlite3
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Callable
 
 import httpx
 
@@ -29,6 +31,7 @@ from crm.hubspot import (
 )
 
 __all__ = [
+    "BACKFILL_ORDER", "Estimate", "backfill", "estimate_backfill",
     "ASSOCIATION_PAIRS", "INCREMENTAL_TYPES", "SEARCH_RESULT_CAP",
     "SEARCH_WINDOW_LIMIT", "SyncReport", "WATERMARK_REWIND_MS", "cursor",
     "normalise_record", "refresh_associations", "refresh_owners",
@@ -200,13 +203,20 @@ def _write_page(conn: sqlite3.Connection, table: str, rows: list[dict],
 
 
 def _complete_type(conn: sqlite3.Connection, object_type: str,
-                   max_modified: int) -> None:
-    """Clear the cursor and advance the watermark: one transaction, at the end."""
+                   max_modified: int, phase: str | None = None) -> None:
+    """Clear the cursor and advance the watermark: one transaction, at the end.
+
+    `phase` is written only when given (the backfill's `complete`), in the same
+    transaction, so a type is never complete without its cursor cleared.
+    """
+    fields = {
+        "cursor": None, "last_modified_ms": max_modified,
+        "status": "ok", "last_run_at": _now_ms(),
+    }
+    if phase is not None:
+        fields["phase"] = phase
     with conn:
-        conn.execute(*_state_sql(object_type, {
-            "cursor": None, "last_modified_ms": max_modified,
-            "status": "ok", "last_run_at": _now_ms(),
-        }))
+        conn.execute(*_state_sql(object_type, fields))
 
 
 def _sync_one_type(conn: sqlite3.Connection, client,
@@ -422,3 +432,114 @@ def sync_incremental(conn: sqlite3.Connection, client,
         report.per_type[object_type] = _sync_object_type(
             conn, client, object_type, report)
     return report
+
+
+# --- backfill ----------------------------------------------------------------
+
+# Briefing objects first, so an interrupted backfill still leaves them usable;
+# engagements are the bulk and come last. Pipelines are not walkable: they are
+# refreshed before the walk. Owners are a small full refresh.
+BACKFILL_ORDER = ["owners", "companies", "deals", "contacts", "engagements"]
+
+BACKFILL_PAGE_SIZE = 100   # matches crm.hubspot.PAGE_SIZE
+UNKNOWN_COUNT = -1         # owners: no /search endpoint, so no cheap total
+COMPLETE = "complete"
+
+
+@dataclass
+class Estimate:
+    object_type: str
+    records: int          # UNKNOWN_COUNT when the API cannot say
+    requests: int         # list requests only; associations are extra
+
+
+def _is_complete(conn: sqlite3.Connection, api_type: str) -> bool:
+    return _state(conn, api_type, "phase") == COMPLETE
+
+
+def _walk_type(conn: sqlite3.Connection, client, api_type: str,
+               progress: Callable[[str, int], None] | None) -> int:
+    """Page one api type's *list* endpoint from its checkpoint to exhaustion.
+
+    Per page, in this order: associations, then rows + cursor in one
+    transaction. A crash before the commit re-reads the page (idempotent); a
+    crash after resumes at the next. Associations come first so a committed
+    cursor never outruns them.
+    """
+    table = table_for(api_type)
+    after = cursor(conn, api_type)
+    if after is None:
+        # List order is by id, not modified date, so the max modified seen is
+        # not a safe watermark: a record walked early and edited later can sit
+        # below it and be missed forever. The walk's start time is safe, and
+        # incremental sync re-reads everything modified since. A resumed walk
+        # (cursor set) keeps the start time stored by its first run.
+        set_watermark(conn, api_type, _now_ms())
+    count = 0
+    while True:
+        page = client.list_page(api_type, after)
+        rows = [normalise_record(api_type, record) for record in page.records]
+        refresh_associations(conn, client, api_type, [r["id"] for r in rows])
+        _write_page(conn, table, rows, api_type, page.after)
+        count += len(rows)
+        if progress:
+            progress(api_type, count)
+        if page.after is None:
+            _complete_type(conn, api_type, watermark(conn, api_type), COMPLETE)
+            return count
+        after = page.after
+
+
+def _backfill_owners(conn: sqlite3.Connection, client,
+                     progress: Callable[[str, int], None] | None) -> int:
+    count = refresh_owners(conn, client)
+    _complete_type(conn, "owners", 0, COMPLETE)
+    if progress:
+        progress("owners", count)
+    return count
+
+
+def backfill(conn: sqlite3.Connection, client,
+             progress: Callable[[str, int], None] | None = None) -> SyncReport:
+    """Resumable initial load over the list endpoints (never search).
+
+    Types whose phase is `complete` are skipped, so a re-run costs nothing and
+    an interrupted one picks up at the last checkpointed page. `RateLimited`
+    propagates with the checkpoint intact. A 4xx or unparseable record is
+    recorded against its type and the checkpoint is *kept*: the pages already
+    written are valuable, and a cleared cursor would re-walk them, possibly
+    millions of records, to hit the same deterministic error.
+    """
+    report = SyncReport()
+    try:
+        refresh_pipelines(conn, client)
+    except _TYPE_ERRORS as exc:
+        report.errors.append(f"pipelines: {exc}")
+    for object_type in BACKFILL_ORDER:
+        count = 0
+        try:
+            for api_type in api_types(object_type):
+                if _is_complete(conn, api_type):
+                    continue
+                if api_type == "owners":
+                    count += _backfill_owners(conn, client, progress)
+                else:
+                    count += _walk_type(conn, client, api_type, progress)
+        except _TYPE_ERRORS as exc:
+            report.errors.append(f"{object_type}: {exc}")
+        report.per_type[object_type] = count
+    return report
+
+
+def estimate_backfill(conn: sqlite3.Connection, client) -> list[Estimate]:
+    """Size the job before committing hours to it. Reads only: no writes."""
+    estimates = []
+    for object_type in BACKFILL_ORDER:
+        if object_type == "owners":
+            estimates.append(Estimate("owners", UNKNOWN_COUNT, 0))
+            continue
+        counts = [client.count(t) for t in api_types(object_type)]
+        estimates.append(Estimate(
+            object_type, sum(counts),
+            sum(math.ceil(n / BACKFILL_PAGE_SIZE) for n in counts)))
+    return estimates

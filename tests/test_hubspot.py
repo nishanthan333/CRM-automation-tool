@@ -285,3 +285,16 @@ def test_persistent_transport_error_raises_rate_limited():
 def test_max_attempts_must_be_at_least_one(bad):
     with pytest.raises(ValueError):
         HubSpotClient("t", max_attempts=bad)
+
+
+def test_count_reads_total_from_an_unfiltered_one_row_search():
+    def handler(request):
+        return httpx.Response(200, json={"total": 1234567, "results": [{"id": "1"}]})
+
+    client, requests = make_client(handler)
+    assert client.count("deals") == 1234567
+    assert requests[0].method == "POST"
+    assert requests[0].url.path == "/crm/v3/objects/deals/search"
+    body = json.loads(requests[0].content)
+    assert body["limit"] == 1
+    assert "filterGroups" not in body

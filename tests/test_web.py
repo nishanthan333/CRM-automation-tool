@@ -103,7 +103,10 @@ def cards(html):
 def test_index_renders_on_empty_database(client_empty):
     r = client_empty.get("/")
     assert r.status_code == 200
-    assert "No data yet" in r.text and "watchdog sync --backfill" in r.text
+    # The command is `watchdog backfill`; `watchdog sync --backfill` does not
+    # exist, and this is the first screen a new user sees.
+    assert "No data yet" in r.text and "<code>watchdog backfill</code>" in r.text
+    assert "sync --backfill" not in r.text
 
 
 def test_index_lists_signals_most_urgent_first(client):

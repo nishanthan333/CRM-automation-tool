@@ -65,6 +65,23 @@ def test_schema_prompt_contains_no_row_data(conn):
     assert "'d1'" not in p and "c1" not in p.replace("c1_", "")
 
 
+def test_the_archived_rule_names_the_only_tables_that_have_the_column(conn):
+    """`archived` exists on the five object tables only, and schema_prompt
+    ships every table, so an unscoped rule invites `no such column: archived`
+    on any question about a snooze or a flag."""
+    from crm.ask import _INSTRUCTIONS
+    rule = next(line for line in _INSTRUCTIONS.splitlines()
+                if "archived" in line and line.startswith("-"))
+    schema = schema_prompt(conn)
+    without = [name for name in (
+        "associations", "sync_state", "signal_results", "snoozes", "meta")
+        if f"{name}(" in schema]
+    assert without, "schema_prompt no longer ships the column-less tables"
+    for name in ("contacts", "companies", "deals", "engagements", "owners"):
+        assert name in rule, name
+    assert "never reference it elsewhere" in rule
+
+
 # --- guard -----------------------------------------------------------------
 
 @pytest.mark.parametrize("bad", [

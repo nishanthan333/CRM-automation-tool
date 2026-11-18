@@ -391,8 +391,47 @@ def test_reference_data_failure_does_not_gate_the_object_sync(
     fake_client.list_page = boom
     report = sync_incremental(conn, fake_client, ["deals"])
     assert report.per_type == {"deals": 2}
-    assert any(e.startswith("owners:") for e in report.errors)
+    assert any(w.startswith("owners:") for w in report.warnings)
     assert conn.execute("select count(*) from deals").fetchone()[0] == 2
+
+
+def _signals_phase(conn):
+    row = conn.execute("SELECT phase, status FROM sync_state"
+                       " WHERE object_type = 'signals'").fetchone()
+    return row["phase"]
+
+
+@pytest.mark.parametrize("attribute, name", [("account_details", "account"),
+                                             ("list_page", "owners")])
+def test_cosmetic_reference_data_failure_is_a_warning_not_a_partial_briefing(
+        conn, fake_client, attribute, name):
+    """Owners and the account-info lookup only build links and labels; five
+    signals depend on `stages`, nothing depends on these."""
+    two_deal_pages(fake_client)
+    real = getattr(fake_client, attribute)
+
+    def boom(object_type=None, *args, **kwargs):
+        if object_type in (None, "owners"):
+            raise http_error(403)
+        return real(object_type, *args, **kwargs)
+
+    setattr(fake_client, attribute, boom)
+    report = sync_incremental(conn, fake_client, ["deals"])
+    assert report.errors == []
+    assert any(w.startswith(f"{name}:") for w in report.warnings)
+    assert _signals_phase(conn) == "complete"
+
+
+def test_stale_pipelines_still_make_the_briefing_partial(conn, fake_client):
+    two_deal_pages(fake_client)
+
+    def boom(object_type):
+        raise http_error(403)
+
+    fake_client.list_pipelines = boom
+    report = sync_incremental(conn, fake_client, ["deals"])
+    assert any(e.startswith("pipelines:") for e in report.errors)
+    assert _signals_phase(conn) == "partial"
 
 
 def test_a_malformed_date_is_confined_to_its_own_type(conn, fake_client):

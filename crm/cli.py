@@ -89,6 +89,13 @@ def _say_blocked(blocked: list[tuple[str, str]]) -> None:
           file=sys.stderr)
 
 
+def _say_warnings(warnings: list[str]) -> None:
+    """A reference-data failure that costs a link or a label, not a signal.
+    Said out loud, but it fails nothing: see `SyncReport`."""
+    for warning in warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+
+
 def _say_errors(errors: list[str]) -> None:
     for error in errors:
         print(f"error: {error}", file=sys.stderr)
@@ -215,6 +222,8 @@ def scheduled_sync(cfg: Config) -> None:
         for api_type, message in blocked_types(conn):
             log.warning("%s is blocked: %s", api_type, message)
         report = sync_incremental(conn, make_client(cfg))
+        for warning in report.warnings:
+            log.info("sync: %s", warning)
         for error in report.errors:
             log.warning("sync: %s", error)
         log.info("sync finished: %s", report.per_type)
@@ -238,6 +247,7 @@ def cmd_sync(args, home: Path) -> int:
         for object_type, count in report.per_type.items():
             print(f"{object_type}: {count:,} records changed")
         blocked = blocked_types(conn)
+        _say_warnings(report.warnings)
         _say_errors(report.errors)
         if blocked:
             _say_blocked(blocked)

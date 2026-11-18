@@ -95,8 +95,16 @@ _TOP_LEVEL = {"owners"}
 
 @dataclass
 class SyncReport:
+    """`errors` means the briefing may be wrong; `warnings` means it is fine.
+
+    Only `errors` mark the signals `partial` and fail the CLI's exit code. A
+    failure that costs nothing but a link or a label (owners, account info)
+    belongs in `warnings`: a token without the account-info scope, a likely
+    first-run state, must not raise "Data incomplete." on every page forever.
+    """
     per_type: dict[str, int] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
 
 # --- normalisation -----------------------------------------------------------
@@ -420,17 +428,26 @@ def refresh_associations(conn: sqlite3.Connection, client, object_type: str,
 _TYPE_ERRORS = (httpx.HTTPStatusError, ValueError)
 
 
+# Reference data refreshed in full every run, and what its failure costs.
+# `stages` is what `is_closed` comes from, so five signals are wrong without a
+# fresh one: that is an error. Owner names and the portal id only decorate the
+# page, so they are warnings.
+_REFERENCE_DATA = (("pipelines", refresh_pipelines, True),
+                   ("owners", refresh_owners, False),
+                   ("account", refresh_account, False))
+
+
 def _refresh_reference_data(conn: sqlite3.Connection, client,
                             report: SyncReport) -> None:
-    """Pipelines and owners are refreshed in full, and must not gate the
-    object sync they merely support, so even a RateLimited is recorded here."""
-    for name, refresh in (("pipelines", refresh_pipelines),
-                          ("owners", refresh_owners),
-                          ("account", refresh_account)):
+    """Pipelines, owners and account info are refreshed in full, and must not
+    gate the object sync they merely support, so even a RateLimited is recorded
+    here rather than raised. See `SyncReport` on errors versus warnings."""
+    for name, refresh, gating in _REFERENCE_DATA:
         try:
             refresh(conn, client)
         except (RateLimited, *_TYPE_ERRORS) as exc:
-            report.errors.append(f"{name}: {exc}")
+            bucket = report.errors if gating else report.warnings
+            bucket.append(f"{name}: {exc}")
 
 
 def _sync_object_type(conn: sqlite3.Connection, client, object_type: str,

@@ -229,6 +229,23 @@ def test_sync_refuses_when_nothing_has_been_backfilled(home, client, capsys):
     assert client.search_calls == []
 
 
+def test_sync_warns_about_missing_account_info_without_failing(home, client, capsys):
+    conn = db(home)
+    complete_all(conn)
+    conn.close()
+
+    def denied():
+        request = httpx.Request("GET", "https://api.hubapi.com/account-info/v3/details")
+        raise httpx.HTTPStatusError("HTTP 403", request=request,
+                                    response=httpx.Response(403, request=request))
+
+    client.account_details = denied
+    assert main(["sync"]) == 0                   # a link-building nicety only
+    err = capsys.readouterr().err
+    assert "warning: account:" in err
+    assert "error:" not in err
+
+
 def test_sync_surfaces_a_blocked_type(home, client, capsys):
     conn = db(home)
     complete_all(conn)

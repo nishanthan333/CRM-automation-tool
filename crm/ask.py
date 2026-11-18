@@ -85,7 +85,7 @@ Rules:
 - Only read data. Use SELECT (optionally with a WITH clause).
 - Dates are epoch milliseconds in UTC.
 - Deal value is amount_in_home_currency (never amount).
-- Always filter archived = 0.
+- Only the object tables (contacts, companies, deals, engagements, owners) have archived; always filter archived = 0 on those and never reference it elsewhere.
 - The owner of a record is hubspot_owner_id; names are in owners.
 
 Schema:

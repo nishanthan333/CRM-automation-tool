@@ -1,0 +1,5 @@
+{
+  "results": [
+    {"id": "4003", "properties": {"amount_in_home_currency": null, "closedate": null, "createdate": "2026-10-01T12:00:00.000Z", "dealname": "Initech discovery", "dealstage": "appointmentscheduled", "hs_lastmodifieddate": "2026-10-28T11:20:00.000Z", "hs_last_activity_date": "2026-10-27T10:00:00Z", "hubspot_owner_id": "81234567", "pipeline": "default"}, "createdAt": "2026-10-01T12:00:00.000Z", "updatedAt": "2026-10-28T11:20:00.000Z", "archived": false}
+  ]
+}

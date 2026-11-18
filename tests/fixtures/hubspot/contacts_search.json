@@ -1,0 +1,7 @@
+{
+  "total": 1,
+  "results": [
+    {"id": "9001", "properties": {"email": "ada@example.com", "firstname": "Ada", "hs_last_activity_date": "2026-11-05T09:00:00Z", "hubspot_owner_id": "81234567", "lastmodifieddate": "2026-11-05T09:12:44.512Z", "lastname": "Lovelace"}, "createdAt": "2026-01-14T10:00:00.000Z", "updatedAt": "2026-11-05T09:12:44.512Z", "archived": false}
+  ],
+  "paging": {"next": {"after": "100"}}
+}

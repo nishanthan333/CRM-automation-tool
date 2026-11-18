@@ -77,6 +77,9 @@ def test_schema_prompt_contains_no_row_data(conn):
     "pragma writable_schema = 1",
     "with x as (select 1) insert into deals select * from x",
     "with x as (select 1) delete from deals",
+    "with x as (select 1 as a) replace into deals(id) select a from x",
+    "with x as (select 1) update deals set archived = 1",
+    "select 1 where replace into",
     "SELECT 1 -- ; delete from deals",
     "-- hi\nselect 1",
     "/* hi */ select 1",
@@ -106,6 +109,7 @@ def test_guard_rejects_non_select(bad):
     "with x as (select 1 as a) select a from x",
     "select 'a;b', 'delete -- x', \"update\" from deals",
     "select 'it''s; pragma' from deals",
+    "select replace(dealname, 'a', 'b'), replace (id, 'x', 'y') from deals",
     "select case when 1 then replace(dealname, 'a', 'b') else 0 end from deals",
 ])
 def test_guard_accepts_single_select(ok):
@@ -125,23 +129,75 @@ def test_guard_leaves_string_literals_alone():
     "```\nselect 1 from deals\n```",
     "```sql\nSELECT 1 FROM deals;\n```\nThis counts deals.",
     "Sure, here it is:\nselect 1 from deals",
+    "Sure, with pleasure:\nselect 1 from deals",
 ])
 def test_fenced_or_prefaced_output_is_unwrapped(raw):
     assert guard_sql(strip_model_output(raw)).lower() == "select 1 from deals"
 
 
-def test_prose_with_no_sql_raises_unsafe():
+@pytest.mark.parametrize("prose", [
+    "I'm not sure what you mean.",
+    "I can't help with that.",
+    "Deals with no owner cannot be counted.",
+    "insert into deals(id) select 'x' from (select 1)",
+])
+def test_prose_or_dml_with_no_sql_line_raises_unsafe(prose):
     with pytest.raises(UnsafeSQL):
-        guard_sql(strip_model_output("I'm not sure what you mean."))
+        strip_model_output(prose)
+
+
+def test_comment_error_is_actionable():
+    with pytest.raises(UnsafeSQL, match="remove the SQL comment"):
+        guard_sql("select 1 -- x")
 
 
 # --- run_query -------------------------------------------------------------
 
-def test_run_query_is_readonly(db_path):
-    with pytest.raises(sqlite3.OperationalError):
-        run_query(db_path, "delete from deals", 1.0, 100)
+@pytest.mark.parametrize("sql", [
+    "delete from deals",
+    "with x as (select 1 as a) replace into deals(id) select a from x",
+    "with x as (select 1 as a) insert into deals(id) select a from x",
+    "update deals set archived = 1",
+    "create table z(a)",
+    "drop table deals",
+])
+def test_run_query_refuses_writes_even_unguarded(db_path, sql):
+    with pytest.raises(sqlite3.DatabaseError):
+        run_query(db_path, sql, 1.0, 100)
     n = sqlite3.connect(db_path).execute("select count(*) from deals").fetchone()[0]
     assert n == 30
+
+
+def test_readonly_connection_alone_refuses_writes(db_path):
+    # Layer two, independent of the authorizer.
+    from crm.db import connect_readonly
+    ro = connect_readonly(db_path)
+    with pytest.raises(sqlite3.OperationalError):
+        ro.execute("delete from deals")
+    with pytest.raises(sqlite3.OperationalError):
+        ro.execute("with x as (select 1 as a) replace into deals(id) "
+                   "select a from x")
+    ro.close()
+
+
+def test_authorizer_alone_refuses_writes_on_writable_connection(db_path):
+    from crm.ask import _authorizer
+    w = sqlite3.connect(db_path)
+    w.set_authorizer(_authorizer)
+    for sql in ("with x as (select 1 as a) replace into deals(id) select a from x",
+                "delete from deals", "attach database ':memory:' as p",
+                "pragma query_only = 0"):
+        with pytest.raises(sqlite3.DatabaseError):
+            w.execute(sql)
+    assert w.execute("select count(*) from deals").fetchone()[0] == 30
+    w.close()
+
+
+def test_authorizer_denies_detach_action():
+    import sqlite3 as s
+    from crm.ask import _authorizer
+    assert _authorizer(s.SQLITE_DETACH, None, None, None, None) == s.SQLITE_DENY
+    assert _authorizer(s.SQLITE_SELECT, None, None, None, None) == s.SQLITE_OK
 
 
 def test_run_query_refuses_attach_and_pragma_even_unguarded(db_path):
@@ -220,9 +276,25 @@ def test_ask_returns_sql_when_guard_rejects(conn, cfg):
     assert conn.execute("select count(*) from deals").fetchone()[0] == 30
 
 
-def test_ask_returns_sql_when_model_returns_prose(conn, cfg):
-    r = ask("x", conn, cfg, http=replying("I'm not sure what you mean."))
-    assert r.sql and r.error
+@pytest.mark.parametrize("text", [
+    "I'm not sure what you mean.", "I can't help with that.",
+    "insert into deals(id) select 'x' from (select 1)"])
+def test_ask_returns_model_text_when_it_is_not_sql(conn, cfg, text):
+    r = ask("x", conn, cfg, http=replying(text))
+    assert r.sql == text and r.error and r.rows == []
+    assert conn.execute("select count(*) from deals").fetchone()[0] == 30
+
+
+@pytest.mark.parametrize("body", [[], "str", 5, None])
+def test_ask_survives_malformed_ollama_json(conn, cfg, body):
+    r = ask("x", conn, cfg, http=stub(lambda q: httpx.Response(200, json=body)))
+    assert r.error and "Ollama" in r.error
+
+
+def test_ask_rejects_in_memory_connection(cfg):
+    mem = sqlite3.connect(":memory:")
+    with pytest.raises(ValueError, match="file-backed"):
+        ask("x", mem, cfg, http=refusing())
 
 
 def test_ask_returns_sql_on_timeout(conn, cfg, monkeypatch):

@@ -131,25 +131,28 @@ def generate_sql(question: str, schema: str, cfg: Config, http=None) -> str:
         raise ModelUnavailable(
             f"Ollama answered {exc.response.status_code} for model "
             f"{cfg.ollama_model!r} (is it pulled?)") from exc
-    except (httpx.HTTPError, ValueError, KeyError) as exc:
+    except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
         raise ModelUnavailable(f"Ollama is not reachable at {cfg.ollama_url}") from exc
 
 
 _FENCE = re.compile(r"```[a-zA-Z]*\s*\n?(.*?)```", re.S)
 _SQL_LINE_START = re.compile(r"^[ \t]*(select|with)\b", re.I | re.M)
-_SQL_ANYWHERE = re.compile(r"\b(select|with)\b", re.I)
 
 
 def strip_model_output(raw: str) -> str:
-    """Remove code fences and any leading prose up to the first select/with."""
+    """Remove code fences and any leading prose up to the first line starting
+    with select/with. Raises UnsafeSQL if there is no such line (never guesses
+    a mid-sentence match, which would rewrite what the model said)."""
     text = raw.strip().lstrip("﻿")
     fenced = _FENCE.search(text)
     if fenced:
         text = fenced.group(1)
     else:
         text = text.replace("```", "")
-    m = _SQL_LINE_START.search(text) or _SQL_ANYWHERE.search(text)
-    return text[m.start():].strip() if m else text.strip()
+    m = _SQL_LINE_START.search(text)
+    if not m:
+        raise UnsafeSQL("the model did not return SQL")
+    return text[m.start():].strip()
 
 
 # --- guard -----------------------------------------------------------------
@@ -182,7 +185,7 @@ def _scan(sql: str) -> tuple[str, str]:
             i = j + 1
             continue
         if sql.startswith("--", i) or sql.startswith("/*", i):
-            raise UnsafeSQL("comments are not allowed")
+            raise UnsafeSQL("comments are not allowed: remove the SQL comment")
         if c.isspace():
             if out and out[-1] != " ":
                 out.append(" ")
@@ -211,6 +214,8 @@ def guard_sql(sql: str) -> str:
     words = re.findall(r"[a-z_][a-z0-9_]*", code.lower())
     if not re.match(r"(select|with)\b", body, re.I):
         raise UnsafeSQL("only SELECT queries are allowed")
+    if re.search(r"\breplace\b(?!\s*\()", code.lower()):
+        raise UnsafeSQL("forbidden keyword: replace")  # `WITH ... REPLACE INTO`
     bad = _FORBIDDEN.intersection(words)
     if bad:
         raise UnsafeSQL(f"forbidden keyword: {sorted(bad)[0]}")
@@ -219,8 +224,13 @@ def guard_sql(sql: str) -> str:
 
 # --- execution -------------------------------------------------------------
 
-_DENIED_ACTIONS = {sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH,
-                   sqlite3.SQLITE_PRAGMA}
+# Keyword-independent backstop: whatever the guard misses, a statement that
+# would write or change schema is refused by SQLite itself.
+_DENIED_ACTIONS = {
+    sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH, sqlite3.SQLITE_PRAGMA,
+    sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE,
+    sqlite3.SQLITE_CREATE_TABLE, sqlite3.SQLITE_DROP_TABLE,
+}
 
 
 def _authorizer(action, *_args):
@@ -265,11 +275,11 @@ def run_query(db_path: Path, sql: str, timeout_s: float,
 
 # --- orchestration ---------------------------------------------------------
 
-def _db_path(conn: sqlite3.Connection, cfg: Config) -> Path:
+def _db_path(conn: sqlite3.Connection) -> Path:
     for row in conn.execute("PRAGMA database_list"):
         if row[1] == "main" and row[2]:
             return Path(row[2])
-    return Path(cfg.db_path)
+    raise ValueError("ask() needs a file-backed connection, not :memory:")
 
 
 def ask(question: str, conn: sqlite3.Connection, cfg: Config,
@@ -279,14 +289,16 @@ def ask(question: str, conn: sqlite3.Connection, cfg: Config,
     enough to produce any."""
     if not question.strip():
         return AskResult(error="Type a question first.")
+    db_path = _db_path(conn)
     try:
         raw = generate_sql(question, schema_prompt(conn), cfg, http=http)
     except ModelUnavailable as exc:
         return AskResult(error=str(exc))
-    sql = strip_model_output(raw)
+    sql = raw.strip()
     try:
+        sql = strip_model_output(raw)
         sql = guard_sql(sql)
-        result = run_query(_db_path(conn, cfg), sql, QUERY_TIMEOUT_S, ROW_CAP)
+        result = run_query(db_path, sql, QUERY_TIMEOUT_S, ROW_CAP)
     except UnsafeSQL as exc:
         return AskResult(sql=sql, error=f"Refused to run this query: {exc}")
     except QueryTimeout as exc:

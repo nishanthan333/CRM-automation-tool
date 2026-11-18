@@ -52,7 +52,7 @@ def name_deal(conn, deal_id, name):
 
 @pytest.fixture(autouse=True)
 def home(monkeypatch):
-    monkeypatch.setenv("WATCHDOG_HOME", str(ROOT))
+    monkeypatch.setenv("WATCHDOG_HOME", str(ROOT / "crm" / "defaults"))
 
 
 @pytest.fixture

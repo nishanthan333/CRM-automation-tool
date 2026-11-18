@@ -30,7 +30,7 @@ UTC = timezone.utc
 # Wednesday 2026-11-18 12:00 UTC.
 NOW = int(datetime(2026, 11, 18, 12, 0, tzinfo=UTC).timestamp() * 1000)
 DEFAULT_THRESHOLDS = tomllib.loads(
-    (Path(__file__).parent.parent / "signals.toml").read_text())
+    (Path(__file__).parent.parent / "crm" / "defaults" / "signals.toml").read_text())
 
 _UNSET = object()
 
@@ -127,3 +127,12 @@ def summary(conn, signal_id, now_ms=NOW, thresholds=None):
     return SimpleNamespace(signal_id=sig.id, title=sig.title,
                            severity=sig.severity, count=0, total_value=0.0,
                            by_owner=[], record_ids=ids)
+
+
+@pytest.fixture(autouse=True)
+def _watchdog_home(monkeypatch):
+    """Sync evaluates signals from $WATCHDOG_HOME/signals.toml; the shipped
+    defaults live in crm/defaults. Tests that care set their own."""
+    monkeypatch.setenv(
+        "WATCHDOG_HOME",
+        str(Path(__file__).parent.parent / "crm" / "defaults"))

@@ -20,6 +20,6 @@ def test_load_config_rejects_missing_token(tmp_path):
 
 
 def test_load_thresholds_reads_shipped_signals_toml():
-    t = load_thresholds(Path(__file__).parent.parent / "signals.toml")
+    t = load_thresholds(Path(__file__).parent.parent / "crm" / "defaults" / "signals.toml")
     assert t["thresholds"]["stalled_days"] == 14
     assert t["thresholds"]["big_deal_value"] == 50000

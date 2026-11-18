@@ -35,7 +35,7 @@ from crm.signals import evaluate_all
 from crm.snooze import drop_stale_snoozes
 
 __all__ = [
-    "reconcile", "sync_archived",
+    "reconcile", "sync_archived", "archive_eligible", "backfill_state",
     "BACKFILL_ORDER", "Estimate", "backfill", "estimate_backfill",
     "ASSOCIATION_PAIRS", "INCREMENTAL_TYPES", "SEARCH_RESULT_CAP",
     "SEARCH_WINDOW_LIMIT", "SyncReport", "WATERMARK_REWIND_MS", "cursor",
@@ -625,6 +625,28 @@ def backfill_pending(conn: sqlite3.Connection, object_type: str) -> bool:
     its watermark and cursor belong to the backfill, not to incremental."""
     return any(_state(conn, t, "phase") in (IN_PROGRESS, BLOCKED)
                for t in api_types(object_type))
+
+
+def backfill_state(conn: sqlite3.Connection) -> dict[str, tuple[str | None, str | None]]:
+    """{api_type: (phase, status)} for every type a backfill covers.
+
+    `phase` is the authority: None (never backfilled), `backfill`, `blocked`,
+    `complete`. For a blocked type `status` is "blocked: <message>".
+    """
+    return {t: (_state(conn, t, "phase"), _state(conn, t, "status"))
+            for o in BACKFILL_ORDER for t in api_types(o)}
+
+
+def archive_eligible(conn: sqlite3.Connection) -> list[str]:
+    """Types the weekly archived pass may touch: every api type `complete`.
+
+    Stricter than "no pending backfill": a never-backfilled type (phase NULL)
+    is not pending either, yet archived-only rows inserted into it would be
+    read by no signal. `sync_archived` has no gate of its own, and given an
+    empty list it would fall back to *all* types, so callers must check.
+    """
+    return [o for o in INCREMENTAL_TYPES
+            if all(_is_complete(conn, t) for t in api_types(o))]
 
 
 def _begin_walk(conn: sqlite3.Connection, api_type: str, fresh: bool) -> None:

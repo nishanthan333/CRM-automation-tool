@@ -11,6 +11,7 @@ from crm.sync import (
     cursor,
     normalise_record,
     refresh_pipelines,
+    set_cursor,
     set_watermark,
     sync_incremental,
     to_epoch_ms,
@@ -300,6 +301,61 @@ def test_search_window_restarts_before_the_result_cap(
     assert watermark(conn, "deals") == MOD_2
     assert [r["id"] for r in conn.execute("select id from deals order by id")] \
         == ["4001", "4002"]
+
+
+def test_a_resumed_cursor_re_windows_instead_of_paging_toward_the_cap(
+        conn, fake_client):
+    """The `after` token is opaque, so we cannot know how deep into the cap it
+    already sits. A resumed cursor must re-window at the first page boundary,
+    not page a further SEARCH_WINDOW_LIMIT records on top of an unknown offset.
+    Note: no monkeypatched limit here — the real 9,000 must not be reached."""
+    set_watermark(conn, "deals", START)
+    set_cursor(conn, "deals", "deep-cursor")
+    served = []
+
+    def search(object_type, since_ms, after):
+        served.append((since_ms, after))
+        if len(served) == 1:
+            return Page(records=[deal("4001", MOD_1_ISO)], after="next-page")
+        return Page(records=[deal("4002", MOD_2_ISO)], after=None)
+
+    fake_client.search_modified_since = search
+    sync_incremental(conn, fake_client, ["deals"])
+
+    assert served == [(START - WATERMARK_REWIND_MS, "deep-cursor"),
+                      (MOD_1 - 1, None)]
+    assert watermark(conn, "deals") == MOD_2
+    assert cursor(conn, "deals") is None
+
+
+def test_a_failed_type_drops_its_cursor_so_the_next_run_re_walks(
+        conn, fake_client):
+    """A cursor a type failed on may be poisoned; the watermark holds the line."""
+    set_watermark(conn, "deals", START)
+    served = []
+
+    def search(object_type, since_ms, after):
+        served.append(after)
+        if len(served) == 1:
+            return Page(records=[deal("4001", MOD_1_ISO)], after="page-2-cursor")
+        raise http_error(400)
+
+    fake_client.search_modified_since = search
+    report = sync_incremental(conn, fake_client, ["deals"])
+
+    assert any(e.startswith("deals:") for e in report.errors)
+    assert cursor(conn, "deals") is None
+    assert watermark(conn, "deals") == START
+
+
+def test_a_rate_limited_type_keeps_its_cursor(conn, fake_client):
+    """The opposite case: resuming from the checkpoint is the point of backoff."""
+    set_watermark(conn, "deals", START)
+    two_deal_pages(fake_client)
+    fake_client.fail_on_page = 2
+    with pytest.raises(RateLimited):
+        sync_incremental(conn, fake_client, ["deals"])
+    assert cursor(conn, "deals") == "page-2-cursor"
 
 
 def test_a_window_that_cannot_advance_fails_loudly(

@@ -30,9 +30,10 @@ from crm.hubspot import (
 
 __all__ = [
     "ASSOCIATION_PAIRS", "INCREMENTAL_TYPES", "SEARCH_RESULT_CAP",
-    "SEARCH_WINDOW_LIMIT", "SyncReport", "WATERMARK_REWIND_MS", "cursor", "normalise_record", "refresh_associations",
-    "refresh_owners", "refresh_pipelines", "set_cursor", "set_watermark",
-    "sync_incremental", "to_epoch_ms", "watermark",
+    "SEARCH_WINDOW_LIMIT", "SyncReport", "WATERMARK_REWIND_MS", "cursor",
+    "normalise_record", "refresh_associations", "refresh_owners",
+    "refresh_pipelines", "set_cursor", "set_watermark", "sync_incremental",
+    "to_epoch_ms", "watermark",
 ]
 
 # Rewind applied to the stored watermark when reading, for clock skew and
@@ -42,7 +43,7 @@ WATERMARK_REWIND_MS = 60_000
 # The search endpoint caps at ~10,000 results per query, so a window is cut off
 # well short of it and re-opened from the newest record seen.
 SEARCH_RESULT_CAP = 10_000
-SEARCH_WINDOW_LIMIT = 9_000
+SEARCH_WINDOW_LIMIT = SEARCH_RESULT_CAP - 1_000
 
 # Types the modified-date search can walk. Owners have no /search endpoint and
 # pipelines are two small requests, so both are refreshed in full every run.
@@ -223,7 +224,16 @@ def _sync_one_type(conn: sqlite3.Connection, client,
     modified_column = MODIFIED_PROPERTY[object_type]
     max_modified = stored
     seen: list[str] = []
-    in_window = 0
+
+    # `in_window` tracks how deep into the search's ~10,000-result cap the next
+    # request would sit. A resumed `after` token is opaque — we cannot tell what
+    # offset it already stands at — so it counts as a full window and is
+    # re-windowed at the first page boundary. Re-walking is cheap and idempotent;
+    # paging into the cap wedges the type for good. `read` counts only what this
+    # window actually read, which is what distinguishes a genuine
+    # same-millisecond pile-up from that pessimistic seed.
+    in_window = SEARCH_WINDOW_LIMIT if after is not None else 0
+    read = 0
 
     while True:
         page = client.search_modified_since(object_type, since_ms, after)
@@ -233,28 +243,28 @@ def _sync_one_type(conn: sqlite3.Connection, client,
             if modified is not None:
                 max_modified = max(max_modified, modified)
         in_window += len(rows)
+        read += len(rows)
 
-        # The search endpoint refuses `after` beyond ~10,000 results. Because the
-        # client sorts ascending on the modified property, we can start a fresh
-        # window from the newest record seen instead of paging into the cap —
-        # gap-free, since `GT (max - 1)` re-reads the boundary millisecond.
-        restart = in_window >= SEARCH_WINDOW_LIMIT and page.after is not None
+        # The client sorts ascending on the modified property, so a fresh window
+        # from the newest record seen loses nothing: `GT (max - 1)` re-reads the
+        # boundary millisecond rather than skipping past it.
+        next_since = max(max_modified - 1, 0)
+        full = in_window >= SEARCH_WINDOW_LIMIT and page.after is not None
+        restart = full and next_since > since_ms
         _write_page(conn, table, rows, object_type,
                     None if restart else page.after)
         seen.extend(row["id"] for row in rows)
 
         if page.after is None:
             return len(seen), seen, max_modified
-        if not restart:
-            after = page.after
+        if restart:
+            since_ms, after, in_window, read = next_since, None, 0, 0
             continue
-
-        next_since = max(max_modified - 1, 0)
-        if next_since <= since_ms:
+        if full and read >= SEARCH_WINDOW_LIMIT:
             raise RuntimeError(
-                f"{object_type}: {in_window} records share one millisecond at "
+                f"{object_type}: {read} records share one millisecond at "
                 f"{max_modified}; cannot advance past the search result cap")
-        since_ms, after, in_window = next_since, None, 0
+        after = page.after
 
 
 # --- full refreshes ----------------------------------------------------------
@@ -386,6 +396,14 @@ def _sync_object_type(conn: sqlite3.Connection, client, object_type: str,
             _complete_type(conn, api_type, max_modified)
     except _TYPE_ERRORS as exc:
         report.errors.append(f"{object_type}: {exc}")
+        # Whatever the window accounting says, a cursor this type failed on may
+        # be poisoned — deep past the result cap, say. The watermark has not
+        # moved, so dropping the cursor re-walks from there next run: no records
+        # skipped, and the upserts make the repeat free of side effects.
+        # A RateLimited is different: it propagates, and resuming from its
+        # checkpoint is the whole point of the backoff.
+        for api_type in api_types(object_type):
+            set_cursor(conn, api_type, None)
     return count
 
 

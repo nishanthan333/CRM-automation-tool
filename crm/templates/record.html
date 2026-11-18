@@ -27,12 +27,15 @@
 <h2>Activity</h2>
 {% if engagements.unavailable %}
 <p class="muted">Activity history unavailable: {{ engagements.unavailable }}. The flags above do not depend on it.</p>
-{% elif not engagements.total %}
+{% else %}
+{% if engagements.partial %}<p class="muted">{{ engagements.partial }}</p>{% endif %}
+{% if not engagements.total %}
 <p class="muted">No engagements are associated with this record.</p>
 {% else %}
 <ul>
   {% for e in engagements.rows %}<li>{{ e.type }} <span class="muted">{{ e.when }}</span></li>{% endfor %}
 </ul>
 <p class="muted">{{ engagements.total }} associated{% if engagements.missing %}; {{ engagements.missing }} not synced locally yet{% endif %}.</p>
+{% endif %}
 {% endif %}
 {% endblock %}

@@ -13,6 +13,7 @@ with warnings.catch_warnings():
     from fastapi.testclient import TestClient
 
 from crm.config import Config
+from crm.hubspot import ENGAGEMENT_TYPES
 from crm.signals import evaluate_all
 from crm.web import create_app
 from tests.conftest import (DEFAULT_THRESHOLDS, NOW, UTC, add_company,
@@ -241,14 +242,40 @@ def test_record_page_explains_why_it_is_flagged(client):
 
 
 def test_record_page_fetches_engagements_on_demand(seeded, fake_client):
-    fake_client.associations[("deals", "engagements")] = {"d1": ["e1"]}
+    # HubSpot v3 has no generic "engagements" object: the five real types are
+    # read one at a time and their ids unioned.
+    fake_client.associations[("deals", "calls")] = {"d1": ["e1"]}
+    fake_client.associations[("deals", "notes")] = {"d1": ["e2"]}
+    with seeded:
+        seeded.executemany(
+            "INSERT INTO engagements (id, type, timestamp) VALUES (?, ?, ?)",
+            [("e1", "calls", days_ago(2)), ("e2", "notes", days_ago(1))])
+    body = build(seeded, fake_client).get("/record/deals/d1").text
+    assert [c.to_type for c in fake_client.assoc_calls] == list(ENGAGEMENT_TYPES)
+    assert all(c.ids == ["d1"] for c in fake_client.assoc_calls)
+    assert "calls" in body and "notes" in body
+    assert "2 associated" in body
+    assert "unavailable" not in body
+
+
+def test_record_page_degrades_when_one_engagement_type_fails(seeded, fake_client):
+    fake_client.associations[("deals", "calls")] = {"d1": ["e1"]}
     with seeded:
         seeded.execute("INSERT INTO engagements (id, type, timestamp) VALUES"
                        " ('e1', 'calls', ?)", (days_ago(2),))
-    body = build(seeded, fake_client).get("/record/deals/d1").text
-    assert fake_client.assoc_calls[-1].to_type == "engagements"
-    assert fake_client.assoc_calls[-1].ids == ["d1"]
-    assert "calls" in body
+    real = fake_client.batch_associations
+
+    def flaky(from_type, to_type, ids):
+        if to_type == "tasks":
+            raise RuntimeError("hubspot down")
+        return real(from_type, to_type, ids)
+
+    fake_client.batch_associations = flaky
+    r = build(seeded, fake_client).get("/record/deals/d1")
+    assert r.status_code == 200
+    assert "calls" in r.text                      # what did arrive is shown
+    assert "tasks" in r.text                      # and the gap is named
+    assert "Activity history unavailable" not in r.text
 
 
 def test_record_page_renders_without_engagements_when_fetch_fails(client, fake_client):

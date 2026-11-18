@@ -32,7 +32,7 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 from crm.ask import ask
 from crm.config import Config, home_dir, load_thresholds
 from crm.db import connect, migrate
-from crm.hubspot import HubSpotClient
+from crm.hubspot import ENGAGEMENT_TYPES, HubSpotClient
 from crm.signals import (SIGNALS, UNASSIGNED, briefing, explain, flagged_page,
                          flags_for_record, owner_rollups, total_at_risk)
 from crm.snooze import SNOOZE_FIELDS, snooze
@@ -302,24 +302,47 @@ def _present(conn: sqlite3.Connection, column: str, value) -> str:
     return str(value)
 
 
+def _fetch_reason(exc: Exception) -> str:
+    if (isinstance(exc, httpx.HTTPStatusError)
+            and exc.response.status_code in (401, 403)):
+        return ("HubSpot rejected the token or its scopes; "
+                "check the private app's read access")
+    return "HubSpot could not be reached just now"
+
+
 def _engagements(client, conn: sqlite3.Connection, record_type: str,
                  record_id: str) -> dict:
     """This record's engagements, fetched now. `unavailable` holds the reason.
 
+    HubSpot v3 has no generic `engagements` object (see `crm.hubspot`), so the
+    five real types are read one at a time and their ids unioned: five batch
+    reads for this one record, on a page a person opened.
+
     The briefing never depends on this, so any failure (rate limit, network,
-    a bad token) degrades to a notice instead of failing the page.
+    a bad token) degrades to a notice instead of failing the page. One type
+    failing costs only that type: what arrived is still shown, with the gap
+    named, and only an all-five failure is reported as unavailable.
     """
-    try:
-        links = client.batch_associations(record_type, "engagements", [record_id])
-        ids = [str(i) for i in links.get(record_id, [])]
-    except Exception as exc:  # noqa: BLE001 - deliberately never fails the page
-        log.warning("engagement fetch for %s %s failed: %s: %s",
-                    record_type, record_id, type(exc).__name__, exc)
-        if (isinstance(exc, httpx.HTTPStatusError)
-                and exc.response.status_code in (401, 403)):
-            return {"unavailable": "HubSpot rejected the token or its scopes; "
-                    "check the private app's read access"}
-        return {"unavailable": "HubSpot could not be reached just now"}
+    ids: list[str] = []
+    failed: list[str] = []
+    first_error: Exception | None = None
+    for engagement_type in ENGAGEMENT_TYPES:
+        try:
+            links = client.batch_associations(
+                record_type, engagement_type, [record_id])
+        except Exception as exc:  # noqa: BLE001 - never fails the page
+            log.warning("%s engagement fetch for %s %s failed: %s: %s",
+                        engagement_type, record_type, record_id,
+                        type(exc).__name__, exc)
+            failed.append(engagement_type)
+            first_error = first_error or exc
+            continue
+        ids.extend(str(i) for i in links.get(record_id, []))
+    if first_error is not None and len(failed) == len(ENGAGEMENT_TYPES):
+        return {"unavailable": _fetch_reason(first_error)}
+    ids = list(dict.fromkeys(ids))
+    partial = (f"{', '.join(failed)} could not be fetched just now, so this "
+               "list is incomplete.") if failed else None
     found: list[sqlite3.Row] = []
     for start in range(0, len(ids), 500):
         chunk = ids[start:start + 500]
@@ -329,6 +352,7 @@ def _engagements(client, conn: sqlite3.Connection, record_type: str,
             chunk).fetchall()
     found.sort(key=lambda r: r["timestamp"] or 0, reverse=True)
     return {"total": len(ids), "missing": len(ids) - len(found),
+            "partial": partial,
             "rows": [{"type": r["type"], "when": _stamp(r["timestamp"], False)
                       if r["timestamp"] else "—"}
                      for r in found[:ENGAGEMENTS_SHOWN]]}

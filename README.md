@@ -25,10 +25,12 @@ python scripts/seed_demo.py          # writes ./demo, a fictional mortgage broke
 python scripts/serve_demo.py         # dashboard at http://127.0.0.1:8077
 ```
 
-364 loan files across seven officers and two pipelines, shaped so every signal
-fires. Nothing touches the network, and `demo/` is git-ignored — delete it when
-you are done. The thresholds in `demo/signals.toml` are set for loan amounts,
-which is a useful example of the tuning the next section describes.
+364 loan files across seven brokers and two pipelines at a fictional Australian
+brokerage, shaped so every signal fires. Nothing touches the network, and
+`demo/` is git-ignored — delete it when you are done. Its `config.toml` sets
+`timezone = "Australia/Sydney"`, and `demo/signals.toml` counts a loan as big
+at $1.5M rather than the shipped $50,000 — both are the tuning the next section
+describes.
 
 ## Setup, in order
 

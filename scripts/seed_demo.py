@@ -2,9 +2,10 @@
 """Fill a local database with a fictional mortgage brokerage, so the dashboard
 can be looked at without a HubSpot account.
 
-Harbour & Vale Mortgage Group: seven loan officers, two pipelines (purchase and
-refinance/investment), referral partners (realtors, builders, CPAs, title
-companies) as companies, borrowers as contacts, and one loan file per deal.
+Harbour & Vale Finance Group, an Australian broker: seven brokers, two pipelines
+(purchase and refinance/investment), referral partners (agencies, builders,
+conveyancers, accountants) as companies, borrowers as contacts, and one loan
+file per deal.
 
 The data is shaped to make every enabled signal fire, including the awkward
 cases a real portal will have: deals with no owner, loans with no amount, a
@@ -30,13 +31,15 @@ DAY = 86_400_000
 NOW = int(datetime.now(timezone.utc).timestamp() * 1000)
 RNG = random.Random(20261118)   # reproducible: the same portal every run
 
-# Loan amounts, not commission: it is the deal amount a brokerage puts in
+# Loan amounts in AUD, not commission: it is the deal amount a brokerage puts in
 # HubSpot, and it makes "at risk" read as the pipeline a manager worries about.
-BIG_LOAN = 750_000
+# A Sydney median purchase is around a million, so "big" has to start above it
+# or two thirds of the book is a big deal.
+BIG_LOAN = 1_500_000
 
 OWNERS = [
     ("51", "priya.raghunathan", "Priya", "Raghunathan"),
-    ("52", "d.okonkwo", "Daniel", "Okonkwo"),
+    ("52", "d.nguyen", "Dieu", "Nguyen"),
     ("53", "s.clarke", "Siobhan", "Clarke"),
     ("54", "m.webb", "Marcus", "Webb"),
     ("55", "y.tanaka", "Yuki", "Tanaka"),
@@ -49,76 +52,80 @@ PIPELINES = [("purchase", "Residential Purchase"), ("refi", "Refinance & Investm
 
 # (id, pipeline, label, order, is_closed, probability)
 STAGES = [
-    ("p_lead",         "purchase", "New Lead",           1, 0, 0.10),
-    ("p_preapproval",  "purchase", "Pre-Approval",       2, 0, 0.25),
-    ("p_application",  "purchase", "Application",        3, 0, 0.45),
-    ("p_processing",   "purchase", "Processing",          4, 0, 0.60),
-    ("p_underwrite",   "purchase", "Underwriting",       5, 0, 0.75),
-    ("p_cleartoclose", "purchase", "Clear to Close",     6, 0, 0.92),
-    ("p_funded",       "purchase", "Funded",             7, 1, 1.00),
-    ("p_dead",         "purchase", "Denied / Withdrawn", 8, 1, 0.00),
-    ("r_enquiry",      "refi",     "Rate Enquiry",       1, 0, 0.10),
-    ("r_application",  "refi",     "Application",        2, 0, 0.40),
-    ("r_appraisal",    "refi",     "Appraisal Ordered",  3, 0, 0.65),
-    ("r_underwrite",   "refi",     "Underwriting",       4, 0, 0.80),
-    ("r_funded",       "refi",     "Funded",             5, 1, 1.00),
-    ("r_dead",         "refi",     "Withdrawn",          6, 1, 0.00),
+    ("p_lead",         "purchase", "New Enquiry",            1, 0, 0.10),
+    ("p_preapproval",  "purchase", "Pre-Approval",           2, 0, 0.25),
+    ("p_application",  "purchase", "Application Submitted",  3, 0, 0.45),
+    ("p_processing",   "purchase", "Valuation Ordered",      4, 0, 0.60),
+    ("p_underwrite",   "purchase", "Conditional Approval",   5, 0, 0.75),
+    ("p_cleartoclose", "purchase", "Unconditional Approval", 6, 0, 0.92),
+    ("p_funded",       "purchase", "Settled",                7, 1, 1.00),
+    ("p_dead",         "purchase", "Declined / Withdrawn",   8, 1, 0.00),
+    ("r_enquiry",      "refi",     "Rate Review",            1, 0, 0.10),
+    ("r_application",  "refi",     "Application Submitted",  2, 0, 0.40),
+    ("r_appraisal",    "refi",     "Valuation Ordered",      3, 0, 0.65),
+    ("r_underwrite",   "refi",     "Credit Assessment",      4, 0, 0.80),
+    ("r_funded",       "refi",     "Settled",                5, 1, 1.00),
+    ("r_dead",         "refi",     "Withdrawn",              6, 1, 0.00),
 ]
 OPEN_PURCHASE = [s[0] for s in STAGES if s[1] == "purchase" and not s[4]]
 OPEN_REFI = [s[0] for s in STAGES if s[1] == "refi" and not s[4]]
 
 PARTNERS = [
-    ("Cascade & Reed Realty", "cascadereed.com"),
-    ("Thornbury Property Group", "thornburyproperty.com"),
-    ("Willowmere Homes", "willowmerehomes.com"),
-    ("Keystone Title Services", "keystonetitle.com"),
-    ("Aldergrove Builders", "aldergrovebuilders.com"),
-    ("Marchetti & Osei CPAs", "marchettiosei.com"),
-    ("Blue Harbor Relocation", "blueharborreloc.com"),
-    ("Sandalwood Realty Partners", "sandalwoodrealty.com"),
-    ("Pinecrest Development Co", "pinecrestdev.com"),
-    ("Varela Home Inspections", "varelainspect.com"),
-    ("Northgate Escrow", "northgateescrow.com"),
-    ("Hollis & Day Realtors", "hollisday.com"),
-    ("Brackenridge Capital", "brackenridgecap.com"),
-    ("Sunfield Property Management", "sunfieldpm.com"),
-    ("Orchard Lane Estates", "orchardlane.com"),
-    ("Tamarind Residential", "tamarindres.com"),
-    ("Quarrystone Partners", "quarrystone.com"),
-    ("Lindholm Realty", "lindholmrealty.com"),
-    ("Everly Court Developments", "everlycourt.com"),
-    ("Castellan Financial Advisors", "castellanfa.com"),
-    ("Redbud Homes", "redbudhomes.com"),
-    ("Ferncliff Estate Agency", "ferncliff.com"),
-    ("Mayweather Title Co", "mayweathertitle.com"),
-    ("Silverbrook Builders", "silverbrookbuild.com"),
-    ("Opaline Realty", "opalinerealty.com"),
+    ("Cascade & Reed Realty", "cascadereed.com.au"),
+    ("Thornbury Property Group", "thornburyproperty.com.au"),
+    ("Willowmere Homes", "willowmerehomes.com.au"),
+    ("Keystone Conveyancing", "keystoneconveyancing.com.au"),
+    ("Aldergrove Constructions", "aldergrove.com.au"),
+    ("Marchetti & Osei Accountants", "marchettiosei.com.au"),
+    ("Blue Harbour Relocations", "blueharbourreloc.com.au"),
+    ("Sandalwood Realty Partners", "sandalwoodrealty.com.au"),
+    ("Pinecrest Developments", "pinecrestdev.com.au"),
+    ("Varela Building Inspections", "varelainspect.com.au"),
+    ("Northgate Settlements", "northgatesettlements.com.au"),
+    ("Hollis & Day Property", "hollisday.com.au"),
+    ("Brackenridge Capital", "brackenridgecap.com.au"),
+    ("Sunfield Strata Management", "sunfieldstrata.com.au"),
+    ("Orchard Lane Estate Agents", "orchardlane.com.au"),
+    ("Tamarind Residential", "tamarindres.com.au"),
+    ("Quarrystone Buyers Agents", "quarrystone.com.au"),
+    ("Lindholm Realty", "lindholmrealty.com.au"),
+    ("Everly Court Developments", "everlycourt.com.au"),
+    ("Castellan Financial Advisers", "castellanfa.com.au"),
+    ("Redbud Homes", "redbudhomes.com.au"),
+    ("Ferncliff Estate Agency", "ferncliff.com.au"),
+    ("Mayweather Conveyancers", "mayweatherconvey.com.au"),
+    ("Silverbrook Builders", "silverbrookbuild.com.au"),
+    ("Opaline Realty", "opalinerealty.com.au"),
 ]
 
 STREETS = [
-    "Thornbury Rise", "Maple Hollow Ct", "Alder Street", "Cresswell Ave",
-    "Pelham Row", "Juniper Bend", "Orchard Lane", "Kestrel Way",
-    "Bramblewood Dr", "Saltmarsh Rd", "Verona Place", "Linden Grove",
-    "Ashford Close", "Nightingale Sq", "Quarry Hill Rd", "Wren Hollow",
-    "Barrowfield Ln", "Clementine St", "Dovecote Way", "Ellery Park",
-    "Fernbank Terrace", "Greenhithe Rd", "Hawthorn Reach", "Ivybridge Walk",
-    "Kingsmead Ave", "Larkspur Ct", "Millbrook Rise", "Netherby Ln",
+    "Boronia Rd", "Wattle St", "Jacaranda Ave", "Bottlebrush Cres",
+    "Kookaburra Pde", "Banksia St", "Lillypilly Ct", "Melaleuca Dr",
+    "Currawong Rd", "Grevillea Gr", "Casuarina Way", "Kurrajong St",
+    "Coolibah Cres", "Waratah Ave", "Tallowwood Rise", "Paperbark Pl",
+    "Bellbird Ln", "Myrtle St", "Hakea Cl", "Ironbark Rd",
+    "Sturt Pde", "Lachlan St", "Macquarie Rd", "Barossa Way",
+    "Nullarbor Cres", "Yarrabee Rd", "Kialla Ct", "Mirrabooka Ave",
 ]
-CITIES = ["Portland", "Bend", "Eugene", "Salem", "Vancouver", "Hillsboro",
-          "Corvallis", "Medford", "Beaverton", "Gresham"]
+# Suburb and state, the way an Australian listing is addressed.
+CITIES = ["Ryde NSW", "Coburg VIC", "Toowong QLD", "Glenelg SA",
+          "Subiaco WA", "Newtown NSW", "Geelong VIC", "Chermside QLD",
+          "Fremantle WA", "Kingston TAS"]
 
 FIRST = ["Alina", "Jonah", "Mei", "Tobias", "Rosa", "Dmitri", "Keisha", "Arun",
          "Freya", "Mateo", "Noor", "Callum", "Ingrid", "Hassan", "Petra",
          "Oyelaran", "Sunniva", "Rafael", "Thandiwe", "Lukas", "Amara",
          "Soren", "Giulia", "Nnamdi", "Esme", "Kiran", "Lars", "Beatriz",
          "Omar", "Saoirse", "Tariq", "Linnea", "Desmond", "Yara", "Piotr",
-         "Adaeze", "Halvard", "Juno", "Rashid", "Clementine"]
+         "Adaeze", "Halvard", "Juno", "Rashid", "Clementine",
+         "Darcy", "Shazia", "Thanh", "Bridie", "Ngaire", "Kostas"]
 LAST = ["Vaszary", "Okafor", "Lindqvist", "Belmonte", "Nakamura", "Ferreira",
         "Abernathy", "Sandoval", "Krishnan", "Haverford", "Dlamini", "Rosetti",
         "Thorsen", "Castellano", "Mwangi", "Petrov", "Alvarado", "Fitzwilliam",
         "Osei", "Bergstrom", "Kowalczyk", "Nakashima", "Varela", "Hollings",
         "Adeyemi", "Marchetti", "Solberg", "Quintero", "Bhattacharya",
-        "Winterbourne", "Fontaine", "Zielinski", "Marsden", "Achebe", "Lund"]
+        "Winterbourne", "Fontaine", "Zielinski", "Marsden", "Achebe", "Lund",
+        "Papadopoulos", "Tran", "Mackellar", "Hoang", "Whitlam", "Chidiac"]
 
 
 def ts(days_ago: float) -> int:
@@ -159,7 +166,7 @@ def build_companies() -> list[dict]:
     # One partner that closed its doors: archived in HubSpot.
     rows.append({
         "id": "c2900", "name": "Harlow Crest Realty (closed)",
-        "domain": "harlowcrest.com", "hubspot_owner_id": "53",
+        "domain": "harlowcrest.com.au", "hubspot_owner_id": "53",
         "hs_last_activity_date": ts(210), "hs_lastmodifieddate": ts(180),
         "archived": 1, "raw": raw(name="Harlow Crest Realty"),
     })
@@ -189,7 +196,7 @@ def _deal(n, stage, pipeline, owner, amount, activity_days, close_days,
         activity_days = max(created_days - RNG.uniform(0.1, 1.5), 0.05)
     addr = f"{RNG.randrange(12, 980)} {RNG.choice(STREETS)}"
     kind = "Purchase" if pipeline == "purchase" else RNG.choice(
-        ["Refinance", "Cash-Out Refi", "Investment Purchase"])
+        ["Refinance", "Equity Release", "Investment Purchase"])
     name = f"{addr}, {RNG.choice(CITIES)} - {kind}"
     return {
         "id": f"d{9000 + n}", "dealname": name, "dealstage": stage,
@@ -217,7 +224,7 @@ def build_deals() -> list[dict]:
         n += 1
 
     def loan():
-        return round(RNG.triangular(185_000, 1_250_000, 420_000), -3)
+        return round(RNG.triangular(320_000, 2_200_000, 680_000), -3)
 
     # Healthy, recently-touched work in both pipelines.
     for _ in range(96):
@@ -250,14 +257,14 @@ def build_deals() -> list[dict]:
             created_days=RNG.uniform(60, 240))
 
     # Closing today: must NOT read as overdue, in any timezone.
-    add(stage="p_cleartoclose", pipeline="purchase", owner="51", amount=505_000,
+    add(stage="p_cleartoclose", pipeline="purchase", owner="51", amount=905_000,
         activity_days=0.3, close_days=0, created_days=48)
 
-    # Big and quiet: jumbo and investment files over a week cold.
+    # Big and quiet: prestige and investment files over a week cold.
     for _ in range(11):
         add(stage=RNG.choice(OPEN_PURCHASE), pipeline="purchase",
             owner=RNG.choice(OWNER_IDS),
-            amount=round(RNG.uniform(BIG_LOAN + 50_000, 2_400_000), -3),
+            amount=round(RNG.uniform(BIG_LOAN + 50_000, 3_200_000), -3),
             activity_days=RNG.uniform(8, 40), close_days=RNG.randrange(8, 70),
             created_days=RNG.uniform(30, 160))
 
@@ -298,7 +305,7 @@ def build_deals() -> list[dict]:
             close_days=RNG.randrange(30, 90), created_days=RNG.uniform(0.2, 4))
 
     # An archived loan file: nothing may flag it.
-    add(stage="p_underwrite", pipeline="purchase", owner="54", amount=640_000,
+    add(stage="p_underwrite", pipeline="purchase", owner="54", amount=1_140_000,
         activity_days=120, close_days=-60, created_days=200, archived=1)
     return rows
 
@@ -357,7 +364,8 @@ def write(home: Path) -> Path:
     cfg = home / "config.toml"
     if not cfg.exists():
         cfg.write_text((defaults / "config.toml.example").read_text()
-                       .replace("pat-na1-REPLACE-ME", "pat-na1-demo-no-live-portal"))
+                       .replace("pat-na1-REPLACE-ME", "pat-ap1-demo-no-live-portal")
+                       .replace('timezone = "local"', 'timezone = "Australia/Sydney"'))
     # Thresholds the brokerage would actually use: the shipped big_deal_value of
     # 50,000 would call every mortgage in the book a big deal.
     (home / "signals.toml").write_text(f"""[thresholds]
@@ -414,9 +422,10 @@ def main() -> int:
             "INSERT OR IGNORE INTO associations (from_type, from_id, to_type, to_id)"
             " VALUES (?, ?, ?, ?)", assoc)
         # A portal id and UI domain, so the "Open in HubSpot" links render.
+        # An Australian portal is served from the ap1 region, not app.hubspot.com.
         conn.executemany("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
                          [("portal_id", "48213907"),
-                          ("ui_domain", "app.hubspot.com")])
+                          ("ui_domain", "app-ap1.hubspot.com")])
         # Present the account as fully backfilled and freshly synced, so the
         # dashboard shows its normal state rather than its empty one.
         conn.executemany(

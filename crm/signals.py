@@ -105,7 +105,7 @@ WHERE d.archived = 0 AND s.is_closed = 0
 """,
         explanation=(
             "An open deal whose close date is an earlier calendar day than today "
-            "in this machine's local timezone. HubSpot stores a close date as "
+            "in the timezone from config.toml. HubSpot stores a close date as "
             "midnight UTC, so dates are compared as days, not instants: a deal "
             "closing today is not overdue in any timezone. A deal with no close "
             "date is not flagged."),

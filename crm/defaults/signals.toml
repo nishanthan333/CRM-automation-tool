@@ -1,0 +1,6 @@
+[thresholds]
+stalled_days = 14
+big_deal_quiet_days = 7
+big_deal_value = 50000
+untouched_account_days = 30
+quiet_pipeline_drop_pct = 40

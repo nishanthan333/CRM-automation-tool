@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}HubSpot Watchdog{% endblock %}</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="/">HubSpot Watchdog</a>
+  <span class="muted">last sync {{ chrome.last_sync }}</span>
+  <span class="muted stale-{{ "yes" if chrome.archives.stale else "no" }}">{{ chrome.archives.text }}{% if chrome.archives.stale %} (overdue: run <code>watchdog reconcile</code>){% endif %}</span>
+  <form method="post" action="/sync"><button type="submit">Sync now</button></form>
+</header>
+<main>
+{% if chrome.notice %}<p class="banner warn" role="status">{{ chrome.notice }}</p>{% endif %}
+{% if chrome.partial %}<p class="banner warn" role="status"><strong>Data incomplete.</strong> {{ chrome.partial }}. Some figures may be out of date until a backfill finishes.</p>{% endif %}
+{% block content %}{% endblock %}
+</main>
+</body>
+</html>

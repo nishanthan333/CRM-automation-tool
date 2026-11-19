@@ -1,0 +1,9 @@
+{
+  "status": "COMPLETE",
+  "results": [
+    {"from": {"id": "4001"}, "to": [{"toObjectId": 7001, "associationTypes": [{"category": "HUBSPOT_DEFINED", "typeId": 5, "label": "Primary"}]}, {"toObjectId": 7002, "associationTypes": [{"category": "HUBSPOT_DEFINED", "typeId": 342, "label": null}]}]},
+    {"from": {"id": "4002"}, "to": [{"toObjectId": 7003, "associationTypes": [{"category": "HUBSPOT_DEFINED", "typeId": 5, "label": "Primary"}]}]}
+  ],
+  "startedAt": "2026-11-18T08:00:00.000Z",
+  "completedAt": "2026-11-18T08:00:00.120Z"
+}

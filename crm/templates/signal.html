@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% from "_macros.html" import rule %}
+{% block title %}{{ signal.title }} · HubSpot Watchdog{% endblock %}
+{% block content %}
+<p><a href="/">← Needs attention</a></p>
+<h1>{{ signal.title }} <span class="badge">{{ signal.severity|upper }}</span></h1>
+{% if summary %}<p class="totals">{{ "{:,}".format(summary.count) }} flagged{% if summary.total_value %} · {{ summary.total_value|money }}{% endif %}</p>{% endif %}
+{{ rule(signal, sql_open=true) }}
+
+<h2>By owner</h2>
+{% if summary %}
+<ol class="owners">
+  <li><a href="/signal/{{ signal.id }}">Everyone</a></li>
+  {% for o in summary.by_owner %}
+  <li><a href="/signal/{{ signal.id }}?owner={{ (o.owner_id or '_none')|urlencode }}">{{ o.label }}</a>
+    <span class="muted">{{ "{:,}".format(o.count) }}{% if o.total_value %} · {{ o.total_value|money }}{% endif %}</span></li>
+  {% endfor %}
+</ol>
+{% else %}<p class="muted">Nothing is flagged under this rule right now.</p>{% endif %}
+
+<h2>Records{% if owner %} · {{ owner_names.get(owner, owner) }}{% endif %}</h2>
+{% if records %}
+<table>
+  <thead><tr><th>Record</th><th>Stage</th><th>Owner</th><th>{{ when_label }}</th><th>Value</th><th></th></tr></thead>
+  <tbody>
+  {% for r in records %}
+  <tr>
+    <td>{% if r.link %}<a href="/record/{{ r.type }}/{{ r.id|urlencode }}">{{ r.name }}</a>{% else %}{{ r.name }}{% endif %}</td>
+    <td class="muted">{{ r.stage }}</td>
+    <td>{{ r.owner }}</td>
+    <td class="muted">{{ r.when }}</td>
+    <td>{% if r.value %}{{ r.value|money }}{% endif %}</td>
+    <td>{% if r.snoozable %}
+      <form method="post" action="/snooze" class="inline">
+        <input type="hidden" name="signal_id" value="{{ signal.id }}">
+        <input type="hidden" name="record_type" value="{{ r.type }}">
+        <input type="hidden" name="record_id" value="{{ r.id }}">
+        <select name="days" aria-label="Snooze for"><option value="7">7 days</option><option value="30">30 days</option></select>
+        <button type="submit">Snooze</button>
+      </form>{% endif %}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+<nav class="pager">
+  {% set q = ("owner=" ~ (owner|urlencode) ~ "&") if owner else "" %}
+  {% if page > 1 %}<a href="/signal/{{ signal.id }}?{{ q }}page={{ page - 1 }}">← Previous</a>{% endif %}
+  <span class="muted">Page {{ page }} of {{ pages }} · {{ "{:,}".format(total) }} records, {{ page_size }} per page</span>
+  {% if page < pages %}<a href="/signal/{{ signal.id }}?{{ q }}page={{ page + 1 }}">Next →</a>{% endif %}
+</nav>
+{% else %}<p class="muted">No records to show.</p>{% endif %}
+{% endblock %}

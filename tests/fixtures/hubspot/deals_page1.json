@@ -1,0 +1,7 @@
+{
+  "results": [
+    {"id": "4001", "properties": {"amount_in_home_currency": "18500.00", "closedate": "2026-12-15T00:00:00.000Z", "createdate": "2026-09-02T10:14:31.822Z", "dealname": "Acme renewal 2027", "dealstage": "contractsent", "hs_lastmodifieddate": "2026-11-10T14:02:55.310Z", "hs_last_activity_date": "2026-11-09T16:30:00Z", "hubspot_owner_id": "81234567", "pipeline": "default"}, "createdAt": "2026-09-02T10:14:31.822Z", "updatedAt": "2026-11-10T14:02:55.310Z", "archived": false},
+    {"id": "4002", "properties": {"amount_in_home_currency": "4200.00", "closedate": "2026-11-30T00:00:00.000Z", "createdate": "2026-09-20T08:01:12.004Z", "dealname": "Globex pilot", "dealstage": "qualifiedtobuy", "hs_lastmodifieddate": "2026-11-12T09:45:10.101Z", "hs_last_activity_date": null, "hubspot_owner_id": "81234568", "pipeline": "default"}, "createdAt": "2026-09-20T08:01:12.004Z", "updatedAt": "2026-11-12T09:45:10.101Z", "archived": false}
+  ],
+  "paging": {"next": {"after": "NTI1Cg%3D%3D", "link": "https://api.hubapi.com/crm/v3/objects/deals?after=NTI1Cg%3D%3D"}}
+}

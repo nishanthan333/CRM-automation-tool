@@ -1,0 +1,26 @@
+[project]
+name = "crm-watchdog"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx",
+    "fastapi",
+    "uvicorn[standard]",
+    "jinja2",
+    "python-multipart",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools]
+packages = ["crm"]
+
+[tool.setuptools.package-data]
+crm = ["templates/*.html", "static/*.css", "defaults/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[project.scripts]
+watchdog = "crm.cli:main"

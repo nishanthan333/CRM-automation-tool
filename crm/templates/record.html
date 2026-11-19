@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% from "_macros.html" import rule %}
+{% block title %}{{ title }} · HubSpot Watchdog{% endblock %}
+{% block content %}
+<p><a href="/">← Needs attention</a></p>
+<h1>{{ title }}</h1>
+<p>{% if hubspot_link %}<a href="{{ hubspot_link }}" rel="noopener noreferrer" target="_blank">Open in HubSpot ↗</a>
+  {% else %}<span class="muted">Run a sync to enable the link back to HubSpot.</span>{% endif %}
+  <span class="muted">({{ record_type }} {{ record_id }})</span></p>
+{% if archived %}<p class="banner warn">This record is archived in HubSpot.</p>{% endif %}
+
+{% if flags %}
+<h2>Why this is flagged</h2>
+{% for f in flags %}
+<details class="card sev-{{ f.severity }}" open>
+  <summary><span class="card-title"><a href="/signal/{{ f.id }}">{{ f.title }}</a></span><span class="badge">{{ f.severity|upper }}</span></summary>
+  {{ rule(f) }}
+</details>
+{% endfor %}
+{% endif %}
+
+<h2>Fields</h2>
+<dl class="fields">
+  {% for f in fields %}<dt>{{ f.label }}</dt><dd>{{ f.value }}</dd>{% endfor %}
+</dl>
+
+<h2>Activity</h2>
+{% if engagements.unavailable %}
+<p class="muted">Activity history unavailable: {{ engagements.unavailable }}. The flags above do not depend on it.</p>
+{% else %}
+{% if engagements.partial %}<p class="muted">{{ engagements.partial }}</p>{% endif %}
+{% if not engagements.total %}
+<p class="muted">No engagements are associated with this record.</p>
+{% else %}
+<ul>
+  {% for e in engagements.rows %}<li>{{ e.type }} <span class="muted">{{ e.when }}</span></li>{% endfor %}
+</ul>
+<p class="muted">{{ engagements.total }} associated{% if engagements.missing %}; {{ engagements.missing }} not synced locally yet{% endif %}.</p>
+{% endif %}
+{% endif %}
+{% endblock %}
